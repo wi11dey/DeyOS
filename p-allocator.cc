@@ -16,6 +16,12 @@ void process_main() {
     pid_t p = sys_getpid();
     srand(p);
 
+    // Make a cool diamond pattern on the console.
+    sys_map_console(console);
+    for (int i = 0; i < CONSOLE_ROWS * CONSOLE_COLUMNS; i++) {
+        console[i] = "/\\"[(i + i/CONSOLE_ROWS) % 2] | 0x3f00;
+    }
+
     // The heap starts on the page right after the 'end' symbol,
     // whose address is the first address not allocated to process code
     // or data.

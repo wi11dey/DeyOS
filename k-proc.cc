@@ -34,6 +34,8 @@ void proc::init_user(pid_t pid, x86_64_pagetable* pt) {
     pagetable_ = pt;
     pstate_ = proc::ps_runnable;
 
+    canary_ = canary;
+
     regs_ = reinterpret_cast<regstate*>(addr + PROCSTACK_SIZE) - 1;
     memset(regs_, 0, sizeof(regstate));
     regs_->reg_cs = SEGSEL_APP_CODE | 3;
@@ -54,6 +56,8 @@ void proc::init_kernel(pid_t pid, void (*f)()) {
     id_ = pid;
     pagetable_ = early_pagetable;
     pstate_ = proc::ps_runnable;
+
+    canary_ = canary;
 
     regs_ = reinterpret_cast<regstate*>(addr + PROCSTACK_SIZE) - 1;
     memset(regs_, 0, sizeof(regstate));

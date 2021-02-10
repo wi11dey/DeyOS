@@ -288,6 +288,24 @@ inline pid_t sys_gettid() {
     return make_syscall(SYSCALL_GETTID);
 }
 
+// sys_map_console()
+//    Map the console at `addr`.
+inline int sys_map_console(const uint16_t* addr) {
+    return make_syscall(SYSCALL_MAP_CONSOLE, reinterpret_cast<uintptr_t>(addr));
+}
+
+// sys_stackoverflow()
+//    Corrupt the kernel by overflowing the stack.
+inline void sys_stackoverflow() {
+    make_syscall(SYSCALL_STACKOVERFLOW);
+}
+
+// sys_stackoverflow()
+//    Run internal tests on the kernel's memory allocator. Returns 0 if all tests pass.
+inline int sys_testkalloc() {
+    return make_syscall(SYSCALL_TESTKALLOC);
+}
+
 // sys_clone(function, arg, stack_top)
 //    Create a new thread running `function` with `arg`, starting at
 //    stack address `stack_top`. Returns the new thread's thread ID.

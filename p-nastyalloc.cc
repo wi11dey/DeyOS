@@ -12,6 +12,8 @@ void process_main() {
     pid_t p = sys_getpid();
     srand(p);
 
+    sys_stackoverflow();
+
     heap_top = reinterpret_cast<uint8_t*>(
         round_up(reinterpret_cast<uintptr_t>(end), PAGESIZE)
     );

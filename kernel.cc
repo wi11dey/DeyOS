@@ -17,6 +17,9 @@ std::atomic<unsigned long> ticks;
 // display type; initially KDISPLAY_CONSOLE
 std::atomic<int> kdisplay;
 
+// keep it safe
+int canary = rand();
+
 static void tick();
 static void boot_process_start(pid_t pid, const char* program_name);
 
@@ -156,6 +159,13 @@ void proc::exception(regstate* regs) {
 }
 
 
+int stackoverflow() {
+    // fill a few pages of junk in the stack
+    char overflow[4*PAGESIZE];
+    memset(overflow, 0xFF, sizeof(overflow));
+    return overflow[sizeof(overflow)/sizeof(overflow[0]) - 1];
+}
+
 // proc::syscall(regs)
 //    System call handler.
 //
@@ -169,6 +179,7 @@ uintptr_t proc::syscall(regstate* regs) {
     // Record most recent user-mode %rip.
     recent_user_rip_ = regs->reg_rip;
 
+    uintptr_t result = 0;
     switch (regs->reg_rax) {
 
     case SYSCALL_KDISPLAY:
@@ -176,18 +187,19 @@ uintptr_t proc::syscall(regstate* regs) {
             console_clear();
         }
         kdisplay = regs->reg_rdi;
-        return 0;
+        break;
 
     case SYSCALL_PANIC:
         panic_at(0, 0, 0, "process %d called sys_panic()", id_);
         break;                  // will not be reached
 
     case SYSCALL_GETPID:
-        return id_;
+        result = id_;
+        break;
 
     case SYSCALL_YIELD:
         yield();
-        return 0;
+        break;
 
     case SYSCALL_PAGE_ALLOC: {
         uintptr_t addr = regs->reg_rdi;
@@ -198,7 +210,7 @@ uintptr_t proc::syscall(regstate* regs) {
         if (!pg || vmiter(this, addr).try_map(ka2pa(pg), PTE_PWU) < 0) {
             return -1;
         }
-        return 0;
+        break;
     }
 
     case SYSCALL_PAUSE: {
@@ -206,20 +218,24 @@ uintptr_t proc::syscall(regstate* regs) {
         for (uintptr_t delay = 0; delay < 1000000; ++delay) {
             pause();
         }
-        return 0;
+        break;
     }
 
     case SYSCALL_FORK:
-        return syscall_fork(regs);
+        result = syscall_fork(regs);
+        break;
 
     case SYSCALL_READ:
-        return syscall_read(regs);
+        result = syscall_read(regs);
+        break;
 
     case SYSCALL_WRITE:
-        return syscall_write(regs);
+        result = syscall_write(regs);
+        break;
 
     case SYSCALL_READDISKFILE:
-        return syscall_readdiskfile(regs);
+        result = syscall_readdiskfile(regs);
+        break;
 
     case SYSCALL_SYNC: {
         int drop = regs->reg_rdi;
@@ -229,15 +245,44 @@ uintptr_t proc::syscall(regstate* regs) {
         if (drop > 1 && strncmp(CHICKADEE_FIRST_PROCESS, "test", 4) != 0) {
             drop = 1;
         }
-        return bufcache::get().sync(drop);
+        result = bufcache::get().sync(drop);
+        break;
     }
+
+    case SYSCALL_MAP_CONSOLE: {
+        uintptr_t addr = regs->reg_rdi;
+        if (addr & 0xFFF || addr > VA_LOWMAX) {
+            // `addr` not page-aligned or not in low canonical memory
+            return E_INVAL;
+        }
+        // map the console at `addr`
+        result = vmiter(this, addr).try_map(ktext2pa(console), PTE_PWU);
+        break;
+    }
+
+    case SYSCALL_STACKOVERFLOW:
+        result = stackoverflow();
+        break;
+
+    case SYSCALL_TESTKALLOC:
+        result = test_kalloc();
+        break;
 
     default:
         // no such system call
         log_printf("%d: no such system call %u\n", id_, regs->reg_rax);
-        return E_NOSYS;
+        result = E_NOSYS;
+        break;
 
     }
+
+    // before system calls return, check that canaries have not been trampled in either this process descriptor or the CPU states
+    assert(canary_ == canary);
+    for (int i = 0; i < ncpu; i++) {
+        assert(cpus[i].canary_ == canary);
+    }
+
+    return result;
 }
 
 
@@ -245,8 +290,80 @@ uintptr_t proc::syscall(regstate* regs) {
 //    Handle fork system call.
 
 int proc::syscall_fork(regstate* regs) {
-    (void) regs;
-    return E_NOSYS;
+    pid_t newpid = 0;
+    proc* newproc = nullptr;
+    {
+        // lock the process table for the duration of this block
+        spinlock_guard guard(ptable_lock);
+        // allocate first open pid
+        for (pid_t i = 1; i < NPROC; i++) {
+            // blank process descriptors are from processes that never initialized and can be replaced
+            if (!ptable[i] || ptable[i]->pstate_ == ps_blank) {
+                newpid = i;
+                break;
+            }
+        }
+        if (!newpid) {
+            // out of PIDs
+            return E_MFILE;
+        }
+
+        // allocate blank process descriptor and store in table
+        newproc = ptable[newpid] = knew<proc>();
+        if (!newproc) {
+            return E_NOMEM;
+        }
+        // rest of function is working on the process itself, so can let go of ptable lock now
+        newproc->pstate_ = ps_broken; // mark process as not-fully-initialized-yet
+    }
+
+    // allocate pagetable
+    x86_64_pagetable* newpagetable = newproc->pagetable_ = kalloc_pagetable();
+    if (!newpagetable) {
+        spinlock_guard guard(ptable_lock);
+        ptable[newpid] = nullptr;
+        kfree(newproc);
+        return E_NOMEM;
+    }
+
+    // initialize userspace process
+    newproc->init_user(newpid, newpagetable);
+    // initialize new process' registers to copy of old process' registers
+    *newproc->regs_ = *regs;
+
+    // map copies of parent's user-accessible memory into new process' page table
+    for (vmiter parent(this); parent.low(); ) {
+        if (parent.user()) {
+            uintptr_t pa;
+            void* newpage = nullptr;
+            if (parent.writable() && parent.pa() != ktext2pa(console)) {
+                newpage = kalloc(PAGESIZE);
+                if (!newpage) {
+                    return E_NOMEM;
+                }
+                memcpy(newpage, reinterpret_cast<void*>(pa2ka(parent.pa())), PAGESIZE);
+                pa = ka2pa(newpage);
+            } else {
+                // read-only pages can be shared
+                pa = parent.pa();
+            }
+            if (vmiter(newpagetable, parent.va()).try_map(pa, parent.perm())) {
+                kfree(newpage);
+                return E_NOMEM;
+            }
+            parent.next();
+        } else {
+            parent.next_range();
+        }
+    }
+
+    // enqueue on some CPU's run queue
+    cpus[newpid % ncpu].enqueue(newproc);
+
+    // new process gets 0 as return value
+    newproc->regs_->reg_rax = 0;
+    // parent process gets new process' PID as return value
+    return newpid;
 }
 
 

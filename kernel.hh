@@ -20,6 +20,7 @@ struct elf_program;
 //
 //    Functions, constants, and definitions for the kernel.
 
+extern int canary;
 
 // Process descriptor type
 struct __attribute__((aligned(4096))) proc {
@@ -40,6 +41,8 @@ struct __attribute__((aligned(4096))) proc {
 #endif
 
     list_links runq_links_;
+
+    int canary_;
 
 
     proc();
@@ -114,6 +117,7 @@ struct __attribute__((aligned(4096))) cpustate {
     uint64_t gdt_segments_[7];
     x86_64_taskstate taskstate_;
 
+    int canary_;
 
     inline cpustate()
         : self_(this) {
@@ -310,6 +314,8 @@ void* kalloc(size_t sz) __attribute__((malloc));
 //    Free a pointer previously returned by `kalloc`. Does nothing if
 //    `ptr == nullptr`.
 void kfree(void* ptr);
+
+int test_kalloc();
 
 // operator new, operator delete
 //    Expressions like `new (std::nothrow) T(...)` and `delete x` work,

@@ -1,5 +1,6 @@
 #include "kernel.hh"
 #include "k-vmiter.hh"
+#include "k-ahci.hh"
 
 // k-memviewer.cc
 //
@@ -73,6 +74,21 @@ void memusage::refresh() {
     }
 
     memset(v_, 0, (maxpa / PAGESIZE) * sizeof(*v_));
+
+    // mark page used to hold memory map itself
+    mark(ka2pa(v_), f_kernel);
+
+    // mark process descriptors of idle tasks
+    for (int i = 0; i < ncpu; i++) {
+        if (cpus[i].idle_task_) {
+            mark(ka2pa(cpus[i].idle_task_), f_kernel);
+        }
+    }
+
+    // mark AHCI state struct of SATA disk
+    for (uintptr_t addr = ka2pa(sata_disk); addr < ka2pa(sata_disk + 1); addr += PAGESIZE) {
+        mark(addr, f_kernel);
+    }
 
     // mark kernel ranges of physical memory
     // We handle reserved ranges of physical memory separately.

@@ -32,6 +32,8 @@ void cpustate::init() {
     nschedule_ = 0;
     spinlock_depth_ = 0;
 
+    canary_ = canary;
+
     // now initialize the CPU hardware
     init_cpu_hardware();
 }
