@@ -18,20 +18,29 @@ inline waiter::~waiter() {
 }
 
 inline void waiter::prepare(wait_queue& wq) {
-    // your code here
+    spinlock_guard guard(wq.lock_);
+    p_->pstate_ = proc::ps_blocked;
+    wq.q_.push_back(this);
+    wq_ = &wq;
 }
 
 inline void waiter::block() {
     assert(p_ == current());
-    // your code here
+    p_->yield();
+    clear();
 }
 
 inline void waiter::clear() {
-    // your code here
+    spinlock_guard guard(wq_->lock_);
+    p_->pstate_ = proc::ps_runnable;
+    if (links_.is_linked()) {
+        wq_->q_.erase(this);
+    }
 }
 
 inline void waiter::wake() {
-    // your code here
+    // delegate to process
+    p_->wake();
 }
 
 

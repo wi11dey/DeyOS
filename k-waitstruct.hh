@@ -14,7 +14,7 @@ struct spinlock_guard;
 
 struct waiter {
     proc* p_ = nullptr;
-    wait_queue* wq_;
+    wait_queue* wq_ = nullptr;
     list_links links_;
 
     explicit inline waiter();

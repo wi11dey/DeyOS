@@ -275,6 +275,9 @@ struct bitset_view {
 #define SYSCALL_MAP_CONSOLE     128
 #define SYSCALL_STACKOVERFLOW   129
 #define SYSCALL_TESTKALLOC      130
+#define SYSCALL_MSLEEP          131
+#define SYSCALL_GETPPID         132
+#define SYSCALL_WAITPID         133
 
 // System call error return values
 

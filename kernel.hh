@@ -25,7 +25,7 @@ extern int canary;
 // Process descriptor type
 struct __attribute__((aligned(4096))) proc {
     enum pstate_t {
-        ps_blank = 0, ps_runnable = PROC_RUNNABLE, ps_broken
+        ps_blank = 0, ps_runnable = PROC_RUNNABLE, ps_broken, ps_blocked
     };
 
     // These four members must come first:
@@ -41,6 +41,14 @@ struct __attribute__((aligned(4096))) proc {
 #endif
 
     list_links runq_links_;
+    list_links child_links_;
+    list<proc, &proc::child_links_> children_;
+
+    pid_t ppid_;                               // Parent process ID
+
+    int home_cpu_;
+    bool interrupted_ = false;
+    int exit_status_;
 
     int canary_;
 
@@ -63,6 +71,7 @@ struct __attribute__((aligned(4096))) proc {
     [[noreturn]] void yield_noreturn();
     [[noreturn]] void resume();
     [[noreturn]] void panic_nonrunnable();
+    void wake();
 
     inline bool resumable() const;
 

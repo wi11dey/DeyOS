@@ -66,6 +66,7 @@ void cpustate::enqueue(proc* p) {
     spinlock_guard guard(runq_lock_);
     if (current_ != p && !p->runq_links_.is_linked()) {
         assert(p->resumable() || p->pstate_ != proc::ps_runnable);
+        p->home_cpu_ = cpuindex_;
         runq_.push_back(p);
     }
 }

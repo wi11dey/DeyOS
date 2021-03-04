@@ -20,6 +20,11 @@ std::atomic<int> kdisplay;
 // keep it safe
 int canary = rand();
 
+static wait_queue waitpidq;
+
+#define TIMERQS 5
+wait_queue timing_wheel[TIMERQS];
+
 static void tick();
 static void boot_process_start(pid_t pid, const char* program_name);
 
@@ -37,8 +42,10 @@ void kernel_start(const char* command) {
         ptable[i] = nullptr;
     }
 
+    // start init
+    boot_process_start(1, "init");
     // start first process
-    boot_process_start(1, CHICKADEE_FIRST_PROCESS);
+    boot_process_start(2, CHICKADEE_FIRST_PROCESS);
 
     // start running processes
     cpus[0].schedule(nullptr);
@@ -66,6 +73,7 @@ void boot_process_start(pid_t pid, const char* name) {
     void* stkpg = kalloc(PAGESIZE);
     assert(stkpg);
     vmiter(p, MEMSIZE_VIRTUAL - PAGESIZE).map(stkpg, PTE_PWU);
+    vmiter(p, ktext2pa(console)).map(ktext2pa(console), PTE_PWU);
     p->regs_->reg_rsp = MEMSIZE_VIRTUAL;
 
     // add to process table (requires lock in case another CPU is already
@@ -73,7 +81,11 @@ void boot_process_start(pid_t pid, const char* name) {
     {
         spinlock_guard guard(ptable_lock);
         assert(!ptable[pid]);
+        p->ppid_ = 1;
         ptable[pid] = p;
+        if (pid != 1) {
+            ptable[1]->children_.push_back(p);
+        }
     }
 
     // add to run queue
@@ -111,6 +123,11 @@ void proc::exception(regstate* regs) {
         cpustate* cpu = this_cpu();
         if (cpu->cpuindex_ == 0) {
             tick();
+
+            // notify the timing wheel
+            if (!timing_wheel[ticks % TIMERQS].q_.empty()) {
+                timing_wheel[ticks % TIMERQS].wake_all();
+            }
         }
         lapicstate::get().ack();
         regs_ = regs;
@@ -166,6 +183,72 @@ int stackoverflow() {
     return overflow[sizeof(overflow)/sizeof(overflow[0]) - 1];
 }
 
+
+// process_reap(p)
+//    Clean up a zombie.
+
+int process_reap(proc* p) {
+    spinlock_guard guard(ptable_lock);
+
+    // remove from parent
+    ptable[p->ppid_]->children_.erase(p);
+
+    // reparent children
+    while (!p->children_.empty()) {
+        proc* child = p->children_.pop_front();
+        child->ppid_ = 1;
+        ptable[1]->children_.push_back(child);
+    }
+
+    int status = p->exit_status_;
+    kfree(p);
+    kfree(p->pagetable_);
+
+    ptable[p->id_] = nullptr;
+    return status;
+}
+
+
+// process_exit(process, regs)
+//    Exit the given process with status code `status`.
+
+int process_exit(proc* p, int status) {
+    {
+        spinlock_guard guard(ptable_lock);
+
+        // free virtual memory
+        for (vmiter it(p); it.va() < MEMSIZE_VIRTUAL; it.next()) {
+            if (it.perm(PTE_PWU) && it.pa() != ktext2pa(console)) {
+                it.kfree_page();
+            }
+        }
+
+        // switch CPU to safe pagetable before making the current one invalid
+        set_pagetable(early_pagetable);
+        // free pagetable
+        for (ptiter it(p); it.low(); it.next()) {
+            it.kfree_ptp();
+        }
+        // root `pagetable_` pointer cleaned up at a safe time by reaper
+        
+        // wake up the parent
+        proc* parent = ptable[p->ppid_];
+        if (parent && parent->pstate_ == proc::ps_blocked) {
+            parent->interrupted_ = true;
+            parent->wake();
+        }
+    }
+
+    // don't need `ptable_lock` for the wait queue
+    waitpidq.wake_all();
+
+    // schedule to be cleaned up at the right time by reaper
+    p->pstate_ = proc::ps_broken;
+
+    return status;
+}
+
+
 // proc::syscall(regs)
 //    System call handler.
 //
@@ -197,9 +280,69 @@ uintptr_t proc::syscall(regstate* regs) {
         result = id_;
         break;
 
+    case SYSCALL_GETPPID:
+        result = ppid_;
+        break;
+
     case SYSCALL_YIELD:
         yield();
         break;
+
+    case SYSCALL_WAITPID: {
+        pid_t pid = regs->reg_rdi;
+        int options = regs->reg_rsi;
+
+        // ensure valid process ID
+        assert(pid >= 0 && pid < NPROC);
+
+        pid_t parent = 0;
+        {
+            spinlock_guard guard(ptable_lock);
+            if (ptable[pid]) {
+                parent = ptable[pid]->ppid_;
+            }
+        }
+
+        if ((!pid && children_.empty()) || (pid && id_ != parent)) {
+            // either we are not the parent or do not have children
+            result = E_CHILD;
+            break;
+        }
+
+        proc* zombie = nullptr;
+        {
+            waiter w;
+            w.p_ = this;
+            spinlock_guard guard(ptable_lock);
+            proc* child = nullptr;
+            w.block_until(waitpidq, [&, pid, options, child]() mutable -> bool {
+                if (pid) {
+                    if (ptable[pid]->pstate_ == ps_broken) {
+                        zombie = child;
+                    }
+                } else {
+                    // wait for any child
+                    for (child = children_.front(); child; child = children_.next(child)) {
+                        if (child->pstate_ == ps_broken) {
+                            zombie = child;
+                            break;
+                        }
+                    }
+                }
+
+                return zombie || options & W_NOHANG;
+            }, guard);
+        }
+        assert(options & W_NOHANG || zombie->pstate_ == ps_broken);
+
+        if (!zombie && options & W_NOHANG) {
+            result = E_AGAIN;
+            break;
+        }
+
+        result = zombie->id_ | (((long) process_reap(zombie)) << 32);
+        break;
+    }
 
     case SYSCALL_PAGE_ALLOC: {
         uintptr_t addr = regs->reg_rdi;
@@ -220,6 +363,25 @@ uintptr_t proc::syscall(regstate* regs) {
         }
         break;
     }
+
+    case SYSCALL_MSLEEP: {
+        const unsigned long until = ticks + (regs->reg_rdi + 9)/10; // round up
+        interrupted_ = false;
+        waiter w;
+        w.p_ = this;
+        w.block_until(timing_wheel[until % TIMERQS], [&, until]() -> bool {
+            return until <= ticks || interrupted_;
+        });
+        if (interrupted_) {
+            result = E_INTR;
+        }
+        break;
+    }
+
+    case SYSCALL_EXIT:
+        process_exit(this, regs->reg_rdi);
+        yield_noreturn();
+        break;
 
     case SYSCALL_FORK:
         result = syscall_fork(regs);
@@ -314,7 +476,9 @@ int proc::syscall_fork(regstate* regs) {
             return E_NOMEM;
         }
         // rest of function is working on the process itself, so can let go of ptable lock now
-        newproc->pstate_ = ps_broken; // mark process as not-fully-initialized-yet
+        newproc->pstate_ = ps_broken;
+        newproc->ppid_ = id_;
+        children_.push_back(newproc);
     }
 
     // allocate pagetable
@@ -330,6 +494,8 @@ int proc::syscall_fork(regstate* regs) {
     newproc->init_user(newpid, newpagetable);
     // initialize new process' registers to copy of old process' registers
     *newproc->regs_ = *regs;
+    // new process gets 0 as return value
+    newproc->regs_->reg_rax = 0;
 
     // map copies of parent's user-accessible memory into new process' page table
     for (vmiter parent(this); parent.low(); ) {
@@ -339,6 +505,7 @@ int proc::syscall_fork(regstate* regs) {
             if (parent.writable() && parent.pa() != ktext2pa(console)) {
                 newpage = kalloc(PAGESIZE);
                 if (!newpage) {
+                    process_exit(newproc, E_NOMEM);
                     return E_NOMEM;
                 }
                 memcpy(newpage, reinterpret_cast<void*>(pa2ka(parent.pa())), PAGESIZE);
@@ -349,6 +516,7 @@ int proc::syscall_fork(regstate* regs) {
             }
             if (vmiter(newpagetable, parent.va()).try_map(pa, parent.perm())) {
                 kfree(newpage);
+                process_exit(newproc, E_NOMEM);
                 return E_NOMEM;
             }
             parent.next();
@@ -360,8 +528,6 @@ int proc::syscall_fork(regstate* regs) {
     // enqueue on some CPU's run queue
     cpus[newpid % ncpu].enqueue(newproc);
 
-    // new process gets 0 as return value
-    newproc->regs_->reg_rax = 0;
     // parent process gets new process' PID as return value
     return newpid;
 }
@@ -490,6 +656,14 @@ uintptr_t proc::syscall_readdiskfile(regstate* regs) {
     ino->unlock_read();
     ino->put();
     return nread;
+}
+
+// proc::syscall(regs)
+//    Unblock this process and schedule it on its home CPU.
+
+void proc::wake() {
+    pstate_ = ps_runnable;
+    cpus[home_cpu_].enqueue(this);
 }
 
 
