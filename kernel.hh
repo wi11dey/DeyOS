@@ -72,6 +72,7 @@ struct __attribute__((aligned(4096))) proc {
     [[noreturn]] void resume();
     [[noreturn]] void panic_nonrunnable();
     void wake();
+    pid_t waitpid(pid_t pid, int* status = nullptr, int options = 0);
 
     inline bool resumable() const;
 

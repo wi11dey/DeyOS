@@ -29,6 +29,15 @@ static void tick();
 static void boot_process_start(pid_t pid, const char* program_name);
 
 
+void init() {
+    while (true) {
+        if (current()->waitpid(0) == E_CHILD) {
+            process_halt();
+        }
+    }
+}
+
+
 // kernel_start(command)
 //    Initialize the hardware and processes and start running. The `command`
 //    string is an optional string passed from the boot loader.
@@ -43,7 +52,14 @@ void kernel_start(const char* command) {
     }
 
     // start init
-    boot_process_start(1, "init");
+    proc* initproc = knew<proc>();
+    initproc->init_kernel(1, init);
+    {
+        spinlock_guard guard(ptable_lock);
+        ptable[1] = initproc;
+    }
+    cpus[0].enqueue(initproc);
+
     // start first process
     boot_process_start(2, CHICKADEE_FIRST_PROCESS);
 
@@ -81,11 +97,9 @@ void boot_process_start(pid_t pid, const char* name) {
     {
         spinlock_guard guard(ptable_lock);
         assert(!ptable[pid]);
-        p->ppid_ = 1;
         ptable[pid] = p;
-        if (pid != 1) {
-            ptable[1]->children_.push_back(p);
-        }
+        p->ppid_ = 1;
+        ptable[1]->children_.push_back(p);
     }
 
     // add to run queue
@@ -230,7 +244,11 @@ int process_exit(proc* p, int status) {
             it.kfree_ptp();
         }
         // root `pagetable_` pointer cleaned up at a safe time by reaper
-        
+
+        // schedule to be cleaned up at the right time by reaper
+        p->pstate_ = proc::ps_broken;
+        log_printf("AQAAAAAAAAAAAAAAAAAAAAA %d\n", p->id_);
+
         // wake up the parent
         proc* parent = ptable[p->ppid_];
         if (parent && parent->pstate_ == proc::ps_blocked) {
@@ -240,10 +258,9 @@ int process_exit(proc* p, int status) {
     }
 
     // don't need `ptable_lock` for the wait queue
-    waitpidq.wake_all();
+    // waitpidq.wake_all();
 
-    // schedule to be cleaned up at the right time by reaper
-    p->pstate_ = proc::ps_broken;
+    process_reap(p);
 
     return status;
 }
@@ -289,59 +306,10 @@ uintptr_t proc::syscall(regstate* regs) {
         break;
 
     case SYSCALL_WAITPID: {
-        pid_t pid = regs->reg_rdi;
-        int options = regs->reg_rsi;
-
-        // ensure valid process ID
-        assert(pid >= 0 && pid < NPROC);
-
-        pid_t parent = 0;
-        {
-            spinlock_guard guard(ptable_lock);
-            if (ptable[pid]) {
-                parent = ptable[pid]->ppid_;
-            }
-        }
-
-        if ((!pid && children_.empty()) || (pid && id_ != parent)) {
-            // either we are not the parent or do not have children
-            result = E_CHILD;
-            break;
-        }
-
-        proc* zombie = nullptr;
-        {
-            waiter w;
-            w.p_ = this;
-            spinlock_guard guard(ptable_lock);
-            proc* child = nullptr;
-            w.block_until(waitpidq, [&, pid, options, child]() mutable -> bool {
-                if (pid) {
-                    if (ptable[pid]->pstate_ == ps_broken) {
-                        zombie = child;
-                    }
-                } else {
-                    // wait for any child
-                    for (child = children_.front(); child; child = children_.next(child)) {
-                        if (child->pstate_ == ps_broken) {
-                            zombie = child;
-                            break;
-                        }
-                    }
-                }
-
-                return zombie || options & W_NOHANG;
-            }, guard);
-        }
-        assert(options & W_NOHANG || zombie->pstate_ == ps_broken);
-
-        if (!zombie && options & W_NOHANG) {
-            result = E_AGAIN;
-            break;
-        }
-
-        result = zombie->id_ | (((long) process_reap(zombie)) << 32);
-        break;
+        int status;
+        pid_t pid = waitpid(regs->reg_rdi, &status, regs->reg_rsi);
+        result = pid | (((long) status) << 32);
+        break;        
     }
 
     case SYSCALL_PAGE_ALLOC: {
@@ -445,6 +413,63 @@ uintptr_t proc::syscall(regstate* regs) {
     }
 
     return result;
+}
+
+
+pid_t proc::waitpid(pid_t pid, int* status, int options) {
+    // ensure valid process ID
+    assert(pid >= 0 && pid < NPROC);
+
+    pid_t parent = 0;
+    {
+        spinlock_guard guard(ptable_lock);
+        if (ptable[pid]) {
+            parent = ptable[pid]->ppid_;
+        }
+    }
+
+    if ((!pid && children_.empty()) || (pid && id_ != parent)) {
+        // either we are not the parent or do not have children
+        return E_CHILD;
+    }
+
+    proc* zombie = nullptr;
+    {
+        waiter w;
+        w.p_ = this;
+        spinlock_guard guard(ptable_lock);
+        proc* child = nullptr;
+        w.block_until(waitpidq, [&, pid, options, child]() mutable -> bool {
+            if (pid) {
+                if (ptable[pid]->pstate_ == ps_broken) {
+                    zombie = child;
+                }
+            } else {
+                // wait for any child
+                for (child = children_.front(); child; child = children_.next(child)) {
+                    log_printf("CCCCCCCCCCCCCC %d\n", child->id_);
+                    if (child->pstate_ == ps_broken) {
+                        zombie = child;
+                        break;
+                    }
+                }
+            }
+
+            return zombie || options & W_NOHANG;
+        }, guard);
+    }
+    assert(options & W_NOHANG || zombie->pstate_ == ps_broken);
+
+    if (!zombie && options & W_NOHANG) {
+        return E_AGAIN;
+    }
+
+    int exit_status = process_reap(zombie);
+    if (status) {
+        *status = exit_status;
+    }
+
+    return zombie->id_;
 }
 
 

@@ -14,6 +14,22 @@ The final freeing is done in Part D by the reaper, so all the cleanup code is at
 Done.
 
 ### Part C
+I chose to use a per-process linked-list to store each process’ children because of the O(1) insert and delete operations, as well as the existing well-tested implementation in `k-list.cc`. Reparenting a process’ children therefore takes only O(C) time, where C is the number of children a process has, since only the dying process’ `children_` iterated during reparenting, which is a linear-time operation for linked-lists.
+
+Since it became obvious very quickly that most operations which require editing children and parents will also need to touch the process table at some points, I abandoned by initial separate process hierarchy lock and opted to use `ptable_lock` to protect these synchronization invariants:
+ - A process’ `children_` should only be edited when the `ptable_lock` is held.
+ - Similarly, a process’ parent in `ppid_` should only be edited when the `ptable_lock` is held.
+
+### Part D
+Done.
+
+### Part E
+Done.
+
+### Part F
+Done.
+
+### Part G
 Done.
 
 Grading notes
