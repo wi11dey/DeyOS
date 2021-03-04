@@ -205,7 +205,9 @@ int process_reap(proc* p) {
     spinlock_guard guard(ptable_lock);
 
     // remove from parent
-    ptable[p->ppid_]->children_.erase(p);
+    if (p->child_links_.is_linked()) {
+        ptable[p->ppid_]->children_.erase(p);
+    }
 
     // reparent children
     while (!p->children_.empty()) {
@@ -254,7 +256,7 @@ int process_exit(proc* p, int status) {
     }
 
     // don't need `ptable_lock` for the wait queue
-    // waitpidq.wake_all();
+    waitpidq.wake_all();
 
     // schedule to be cleaned up at the right time by reaper
     p->pstate_ = proc::ps_broken;

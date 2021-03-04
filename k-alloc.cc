@@ -150,7 +150,7 @@ void kfree(void* ptr) {
             break;
         }
 
-        if (!pages[buddy].links_.next_ || !pages[buddy].links_.prev_) {
+        if (!pages[buddy].links_.is_linked()) {
             // buddy not reachable (outside of a block)
             break;
         }

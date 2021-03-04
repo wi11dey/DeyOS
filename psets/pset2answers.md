@@ -21,13 +21,15 @@ Since it became obvious very quickly that most operations which require editing 
  - Similarly, a process’ parent in `ppid_` should only be edited when the `ptable_lock` is held.
 
 ### Part D
-Done.
+`waitpid()` uses the same invariants as above when dealing with `ptable` and `ppid_`, with the additional, separate lock on the wait queue when traversing it to clear current waiters, so multiple threads don’t try to traverse at the same time and drop some.
+
+In order to allow `waitpid()` to open up PIDs for reuse when it sees fit, all the finalization code was moved to a shared `process_reap()` that takes care of tying up loose ends.
 
 ### Part E
 Done.
 
 ### Part F
-Done.
+I implemented a timing wheel in `kernel.cc`, which still accurately took care of `sys_msleep`, but needed only around 258 resumes, whereas the singular wait queue for all timing was hitting around 30000 (!)
 
 ### Part G
 Done.
