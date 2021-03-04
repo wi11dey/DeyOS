@@ -245,10 +245,6 @@ int process_exit(proc* p, int status) {
         }
         // root `pagetable_` pointer cleaned up at a safe time by reaper
 
-        // schedule to be cleaned up at the right time by reaper
-        p->pstate_ = proc::ps_broken;
-        log_printf("AQAAAAAAAAAAAAAAAAAAAAA %d\n", p->id_);
-
         // wake up the parent
         proc* parent = ptable[p->ppid_];
         if (parent && parent->pstate_ == proc::ps_blocked) {
@@ -259,6 +255,9 @@ int process_exit(proc* p, int status) {
 
     // don't need `ptable_lock` for the wait queue
     // waitpidq.wake_all();
+
+    // schedule to be cleaned up at the right time by reaper
+    p->pstate_ = proc::ps_broken;
 
     process_reap(p);
 
@@ -447,7 +446,6 @@ pid_t proc::waitpid(pid_t pid, int* status, int options) {
             } else {
                 // wait for any child
                 for (child = children_.front(); child; child = children_.next(child)) {
-                    log_printf("CCCCCCCCCCCCCC %d\n", child->id_);
                     if (child->pstate_ == ps_broken) {
                         zombie = child;
                         break;
