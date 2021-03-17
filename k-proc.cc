@@ -17,7 +17,7 @@ proc::proc() {
 //    Initialize this `proc` as a new runnable user process with PID `pid`
 //    and initial page table `pt`.
 
-void proc::init_user(pid_t pid, x86_64_pagetable* pt) {
+void proc::init_user(pid_t pid, x86_64_pagetable* pt, bool keep_ftable) {
     uintptr_t addr = reinterpret_cast<uintptr_t>(this);
     assert(!(addr & PAGEOFFMASK));
     // ensure layout `k-exception.S` expects
@@ -42,6 +42,10 @@ void proc::init_user(pid_t pid, x86_64_pagetable* pt) {
     regs_->reg_ss = SEGSEL_APP_DATA | 3;
     regs_->reg_rflags = EFLAGS_IF;
     regs_->reg_swapgs = 1;
+
+    if (!keep_ftable) {
+        memset(ftable_, 0, sizeof(file*)*NFILES);
+    }
 }
 
 

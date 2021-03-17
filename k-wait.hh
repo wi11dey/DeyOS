@@ -10,14 +10,9 @@
 //    avoids problems with circular dependencies.)
 
 
-inline waiter::waiter() {
-}
-
-inline waiter::~waiter() {
-    // optional error-checking code
-}
-
 inline void waiter::prepare(wait_queue& wq) {
+    p_ = current();
+    cli();
     spinlock_guard guard(wq.lock_);
     p_->pstate_ = proc::ps_blocked;
     wq.q_.push_back(this);

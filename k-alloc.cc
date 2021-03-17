@@ -29,20 +29,19 @@ void init_kalloc() {
         for (uintptr_t addr = range->first(); addr < range->last(); ) {
             int page = addr/PAGESIZE;
             pages[page].page = page;
-            for (int order = MAX_ORDER; order >= MIN_ORDER; order--) {
-                if (addr + (1 << order) <= range->last() && addr % (1 << order) == 0) {
-                    // biggest order that can fit between `addr` and the end of the range
-                    pages[page].order = order;
 
-                    if (!(pages[page].used = range->type() != mem_available)) {
-                        // range is free
-                        free_heads[order - MIN_ORDER].push_back(&pages[page]);
-                    }
+            // biggest order that can fit between `addr` and the end of the range
+            int order = min(addr ? lsb(addr) - 1 : MAX_ORDER, msb(range->last() - addr - 1));
+            if (order >= MIN_ORDER) {
+                pages[page].order = order;
 
-                    // next block
-                    addr += 1UL << order;
-                    break;
+                if (!(pages[page].used = range->type() != mem_available)) {
+                    // range is free
+                    free_heads[order - MIN_ORDER].push_back(&pages[page]);
                 }
+
+                // next block
+                addr += 1UL << order;
             }
         }
     }
@@ -66,7 +65,7 @@ void* kalloc(size_t sz) {
     if (sz == 0) {
         return nullptr;
     }
-    sz = max(sz, 1UL << MIN_ORDER);
+    sz = max(sz, 1UL << (MIN_ORDER + 1));
 
     int order = msb(sz - 1);
     if (order > MAX_ORDER) {
@@ -130,7 +129,7 @@ void kfree(void* ptr) {
     while (true) {
         // find its buddy either to the left or to the right
         int buddy = (page*PAGESIZE
-                     + (1 << order)*(((page*PAGESIZE)% (1 << (order + 1)) == 0)
+                     + (1 << order)*(((page*PAGESIZE)%(1 << (order + 1)) == 0)
                                      ? 1
                                      : -1)
                      )/PAGESIZE;
@@ -150,18 +149,12 @@ void kfree(void* ptr) {
             break;
         }
 
-        if (!pages[buddy].links_.is_linked()) {
-            // buddy not reachable (outside of a block)
-            break;
-        }
-
         // merge
         free_heads[pages[buddy].order - MIN_ORDER].erase(&pages[buddy]);
         // so long, old buddy
         memset(&pages[max(page, buddy)], 0, sizeof(page));
-        pages[min(page, buddy)].order++;
-
         page = min(page, buddy);
+        order = ++pages[page].order;
     }
 
     free_heads[order - MIN_ORDER].push_back(&pages[page]);

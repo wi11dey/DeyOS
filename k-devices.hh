@@ -23,6 +23,8 @@ struct keyboardstate {
     unsigned eol_ = 0;      // position in buffer of most recent \n
     enum { boot, input, fail } state_ = boot;
 
+    wait_queue waitq_;
+
     static keyboardstate& get() {
         return kbd;
     }
@@ -78,6 +80,8 @@ struct memfile {
     size_t len_;                         // length of file data
     size_t capacity_;                    // # bytes available in `data_`
 
+    spinlock lock_;
+
     inline memfile();
     inline memfile(const char* name, unsigned char* first,
                    unsigned char* last);
@@ -96,6 +100,7 @@ struct memfile {
     // look up the memfile named `name`, creating it if it does not exist
     // and `create == true`. Return an index into `initfs` or an error code.
     static int initfs_lookup(const char* name, bool create = false);
+    static bool check_path(const char* name);
 };
 
 inline memfile::memfile()

@@ -1,5 +1,7 @@
 #include "k-devices.hh"
 #include "k-apic.hh"
+#include "k-wait.hh"
+#include "lib.hh"
 
 // k-devices.cc
 //
@@ -171,6 +173,9 @@ void keyboardstate::handle_interrupt() {
                 }
                 maybe_echo(ch);
             }
+            for (waiter* w = waitq_.q_.front(); w; w = waitq_.q_.next(w)){
+                w->wake();
+            }
             break;
         }
     }
@@ -291,6 +296,7 @@ int memfile::initfs_lookup(const char* name, bool create) {
 //    Returns 0 on success and an error code such as `E_NOSPC` on
 //    failure.
 int memfile::set_length(size_t len) {
+    spinlock_guard guard(lock_);
     // grow file if necessary
     if (len > capacity_) {
         // allocate new data
@@ -319,6 +325,12 @@ int memfile::set_length(size_t len) {
 
     len_ = len;
     return 0;
+}
+
+
+bool memfile::check_path(const char* name){
+    // check null-terminated and at most namesize in length
+    return !name[strnlen(name, namesize)];
 }
 
 

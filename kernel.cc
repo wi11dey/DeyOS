@@ -5,6 +5,7 @@
 #include "k-chkfsiter.hh"
 #include "k-devices.hh"
 #include "k-vmiter.hh"
+#include "vnodes.hh"
 #include "obj/k-firstprocess.h"
 
 // kernel.cc
@@ -24,6 +25,8 @@ static wait_queue waitpidq;
 
 #define TIMERQS 5
 wait_queue timing_wheel[TIMERQS];
+
+wait_queue ioq;
 
 static void tick();
 static void boot_process_start(pid_t pid, const char* program_name);
@@ -85,6 +88,16 @@ void boot_process_start(pid_t pid, const char* name) {
     proc* p = knew<proc>();
     p->init_user(pid, ld.pagetable_);
     p->regs_->reg_rip = ld.entry_rip_;
+
+    // open keyboard/console file descriptors for boot process
+    {
+        spinlock_guard ftable_guard(p->ftable_lock_);
+        file* f = knew<file>(file::ft_keyboard, OF_READ | OF_WRITE, knew<keyboardnode>());
+
+        spinlock_guard keyboard_guard(f->lock_);
+        p->ftable_[0] = p->ftable_[1] = p->ftable_[2] = f;
+        f->ref_ = 3;
+    }
 
     void* stkpg = kalloc(PAGESIZE);
     assert(stkpg);
@@ -210,17 +223,15 @@ int process_reap(proc* p) {
     }
 
     // reparent children
-    while (!p->children_.empty()) {
-        proc* child = p->children_.pop_front();
+    while (proc* child = p->children_.pop_front()) {
         child->ppid_ = 1;
         ptable[1]->children_.push_back(child);
     }
 
     int status = p->exit_status_;
-    kfree(p);
-    kfree(p->pagetable_);
-
     ptable[p->id_] = nullptr;
+    kfree(p->pagetable_);
+    kfree(p);
     return status;
 }
 
@@ -229,6 +240,10 @@ int process_reap(proc* p) {
 //    Exit the given process with status code `status`.
 
 int process_exit(proc* p, int status) {
+    for (int i = 0; i < NFILES; i++) {
+        p->syscall_close(i);
+    }
+
     {
         spinlock_guard guard(ptable_lock);
 
@@ -239,13 +254,16 @@ int process_exit(proc* p, int status) {
             }
         }
 
-        // switch CPU to safe pagetable before making the current one invalid
-        set_pagetable(early_pagetable);
         // free pagetable
         for (ptiter it(p); it.low(); it.next()) {
             it.kfree_ptp();
         }
+        // switch CPU to safe pagetable before making the current one invalid
+        // set_pagetable(early_pagetable);
         // root `pagetable_` pointer cleaned up at a safe time by reaper
+
+        // schedule to be cleaned up at the right time by reaper
+        p->pstate_ = proc::ps_broken;
 
         // wake up the parent
         proc* parent = ptable[p->ppid_];
@@ -257,11 +275,6 @@ int process_exit(proc* p, int status) {
 
     // don't need `ptable_lock` for the wait queue
     waitpidq.wake_all();
-
-    // schedule to be cleaned up at the right time by reaper
-    p->pstate_ = proc::ps_broken;
-
-    process_reap(p);
 
     return status;
 }
@@ -309,7 +322,7 @@ uintptr_t proc::syscall(regstate* regs) {
     case SYSCALL_WAITPID: {
         int status;
         pid_t pid = waitpid(regs->reg_rdi, &status, regs->reg_rsi);
-        result = pid | (((long) status) << 32);
+        result = pid | (((unsigned long) status) << 32);
         break;        
     }
 
@@ -356,12 +369,35 @@ uintptr_t proc::syscall(regstate* regs) {
         result = syscall_fork(regs);
         break;
 
+    case SYSCALL_EXECV:
+        result = syscall_execv(reinterpret_cast<const char*>(regs->reg_rdi), reinterpret_cast<const char* const*>(regs->reg_rsi), regs->reg_rdx);
+        if (!result){
+            yield_noreturn();
+        }
+        break;
+
     case SYSCALL_READ:
         result = syscall_read(regs);
         break;
 
     case SYSCALL_WRITE:
         result = syscall_write(regs);
+        break;
+
+    case SYSCALL_DUP2:
+        result = syscall_dup2(regs->reg_rdi, regs->reg_rsi);
+        break;
+
+    case SYSCALL_CLOSE:
+        result = syscall_close(regs->reg_rdi);
+        break;
+
+    case SYSCALL_PIPE:
+        result = syscall_pipe();
+        break;
+
+    case SYSCALL_OPEN:
+        result = syscall_open(reinterpret_cast<const char*>(regs->reg_rdi), regs->reg_rsi);
         break;
 
     case SYSCALL_READDISKFILE:
@@ -417,9 +453,258 @@ uintptr_t proc::syscall(regstate* regs) {
 }
 
 
+bool proc::check(uintptr_t addr, size_t sz, int perm) {
+    if (!addr){
+        return false;
+    }
+
+    size_t i = 0;
+    for (vmiter it(this, addr & ~PAGEOFFMASK); i < sz + (addr & PAGEOFFMASK); i += PAGESIZE, it += PAGESIZE){
+        if (!it.perm(perm)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+int proc::syscall_open(const char* name, int flags) {
+    if (!check((uintptr_t) name, memfile::namesize, PTE_PWU)) {
+        return E_FAULT;
+    }
+
+    if(!memfile::check_path(name)){
+        return E_INVAL;
+    }
+
+    int index = memfile::initfs_lookup(name, flags & OF_CREATE);
+    if (flags & OF_TRUNC) {
+        spinlock_guard guard(memfile::initfs[index].lock_);
+        memfile::initfs[index].len_ = 0;
+    }
+
+    spinlock_guard ftable_guard(ftable_lock_);
+    int fd;
+    for (fd = 0; fd <= NFILES; fd++) {
+        if (fd == NFILES) {
+            return E_MFILE;
+        }
+
+        if (!ftable_[fd]) {
+            break;
+        }
+    }
+
+    memfile& memfile = memfile::initfs[index];
+    file* f = knew<file>(file::ft_memfile, flags, knew<memnode>(memfile, (flags & OF_WRITE) ? memfile.len_ : 0));
+    ftable_[fd] = f;
+    f->ref_++;
+
+    return fd;
+}
+
+
+long proc::syscall_pipe() {
+    spinlock_guard ftable_guard(ftable_lock_);
+    
+    pipenode* pipe = knew<pipenode>();
+    file* reader = knew<file>(file::ft_pipe, OF_READ, pipe);
+    int rfd;
+    for (rfd = 0; rfd <= NFILES; rfd++) {
+        if (rfd == NFILES) {
+            return E_MFILE;
+        }
+
+        if (!ftable_[rfd]) {
+            break;
+        }
+    }
+    ftable_[rfd] = reader;
+    reader->ref_++;
+    
+
+    file* writer = knew<file>(file::ft_pipe, OF_WRITE, pipe);
+    int wfd;
+    for (wfd = 0; wfd <= NFILES; wfd++) {
+        if (wfd == NFILES) {
+            return E_MFILE;
+        }
+
+        if (!ftable_[wfd]) {
+            break;
+        }
+    }
+    ftable_[wfd] = writer;
+    writer->ref_++;
+
+    pipe->readers_++;
+    pipe->writers_++;
+
+    return rfd | ((long) wfd << 32);
+}
+
+
+int proc::syscall_close(int fd) {
+    if (fd < 0 || fd >= NFILES) {
+        return E_BADF;
+    }
+
+    file* file = ftable_[fd];
+    if (!file) {
+        return E_BADF;
+    }
+
+    bool free_pipe = false;
+    if (file->ftype_ == file::ft_pipe) {
+        pipenode* pipe = (pipenode*) file->vnode_;
+        spinlock_guard pipe_guard(pipe->lock_);
+        if (file->perm_ & OF_READ) {
+            pipe->readers_--;
+        } else {
+            pipe->writers_--;
+        }
+        if (pipe->readers_ <= 0 && pipe->writers_ <= 0) {
+            free_pipe = true;
+        }
+    }
+
+    {
+        spinlock_guard guard(file->lock_);
+        ftable_[fd] = nullptr;
+        file->ref_--;
+    }
+    if (!file->ref_) {
+        if (file->ftype_ != file::ft_pipe || free_pipe) {
+            kfree(file->vnode_);
+            file->vnode_ = nullptr;
+        }
+        kfree(file);
+        file = nullptr;
+    }
+
+    for (waiter* w = ioq.q_.front(); w; w=ioq.q_.next(w)) {
+        w->wake();
+    }
+
+    return 0;
+}
+
+
+int proc::syscall_dup2(int old_fd, int new_fd) {
+    if (old_fd < 0 || old_fd > NFILES || new_fd < 0 || new_fd > NFILES){
+        return E_BADF;
+    }
+
+    if (old_fd == new_fd) {
+        return old_fd;
+    }
+
+    if (!ftable_[old_fd]) {
+        return E_BADF;
+    }
+
+    if(ftable_[new_fd]){
+        syscall_close(new_fd);
+    }
+
+    spinlock_guard old_fd_guard(ftable_[old_fd]->lock_);
+    spinlock_guard ftable_guard(ftable_lock_);
+    if (ftable_[old_fd]->ftype_ == file::ft_pipe) {
+        pipenode* pipe = (pipenode*) ftable_[old_fd]->vnode_;
+        spinlock_guard pipe_guard(pipe->lock_);
+        if (ftable_[old_fd]->perm_ & OF_READ) {
+            pipe->readers_++;
+        } else {
+            pipe->writers_++;
+        }
+    }
+
+    ftable_[old_fd]->ref_++;
+    ftable_[new_fd] = ftable_[old_fd];
+    return new_fd;
+}
+
+
+int proc::syscall_execv(const char* pathname, const char* const* argv, int argc){
+    if (!memfile::check_path(pathname)) {
+        return E_INVAL;
+    }
+
+    if (argc <= 0) {
+        return E_INVAL;
+    }
+
+    for (int i = 0; i < argc; i++){
+        if (!check((uintptr_t) argv[i], strlen(argv[i]), PTE_PWU)) {
+            return E_FAULT;
+        }
+    }
+
+    int mindex = memfile::initfs_lookup(pathname, false);
+    if (mindex < 0){
+        return E_NOENT;
+    }
+
+    x86_64_pagetable* old_pagetable = pagetable_;
+    x86_64_pagetable* pagetable = kalloc_pagetable();
+
+    memfile_loader ld(mindex, pagetable);
+    if (ld.memfile_ == nullptr || ld.pagetable_ == nullptr) {
+        kfree(ld.memfile_);
+        kfree(ld.pagetable_);
+        return E_NOMEM;
+    }
+
+    int r = proc::load(ld);
+    assert(r >= 0);
+
+    char* stack = (char*) kalloc(PAGESIZE);
+    if (stack == nullptr
+        || vmiter(pagetable, CONSOLE_ADDR).try_map(CONSOLE_ADDR, PTE_PWU) < 0
+        || vmiter(pagetable, MEMSIZE_VIRTUAL - PAGESIZE).try_map(stack, PTE_PWU) < 0){
+        kfree(stack);
+        kfree(ld.pagetable_);
+        kfree(ld.memfile_);
+        return E_NOMEM;
+    }
+
+    int offset = 0;
+    char** args = (char**)((uintptr_t) stack + 256);
+    for(int i = 0; i < argc; i++){
+        size_t sz = strlen(argv[i]) + 1;
+        memcpy(stack + offset, argv[i], sz);
+        args[i] = (char*)(MEMSIZE_VIRTUAL - PAGESIZE + offset);
+        offset += sz;
+    }
+    args[argc] = nullptr;
+
+    // clean out the old process and initialize a new one where the exec will happen, keeping open file descriptors intact
+    init_user(id_, ld.pagetable_, true);
+
+    set_pagetable(ld.pagetable_);
+    for (vmiter it(old_pagetable, 0); it.va() != MEMSIZE_VIRTUAL; it.next()) {
+        if (it.perm(PTE_PWU) && it.pa() != ktext2pa(console)){
+            it.kfree_page();
+        }
+    }
+
+    for (ptiter it(old_pagetable); it.low(); it.next()) {
+        it.kfree_ptp();
+    }
+    kfree(old_pagetable);
+    regs_->reg_rip = ld.entry_rip_;
+    regs_->reg_rsp = MEMSIZE_VIRTUAL;
+    regs_->reg_rdi = argc;
+    regs_->reg_rsi=  MEMSIZE_VIRTUAL - PAGESIZE + 256;
+
+    return 0;
+}
+
 pid_t proc::waitpid(pid_t pid, int* status, int options) {
     // ensure valid process ID
-    assert(pid >= 0 && pid < NPROC);
+    if (pid < 0 && pid >= NPROC) {
+        return E_INVAL;
+    }
 
     pid_t parent = 0;
     {
@@ -464,12 +749,13 @@ pid_t proc::waitpid(pid_t pid, int* status, int options) {
         return E_AGAIN;
     }
 
+    pid_t zid = zombie->id_;
     int exit_status = process_reap(zombie);
     if (status) {
         *status = exit_status;
     }
 
-    return zombie->id_;
+    return zid;
 }
 
 
@@ -550,6 +836,24 @@ int proc::syscall_fork(regstate* regs) {
         }
     }
 
+    // copy over file table
+    for (int i = 0; i < NFILES; i++) {
+        if (ftable_[i]) {
+            spinlock_guard file_guard(ftable_[i]->lock_);
+            newproc->ftable_[i] = ftable_[i];
+            ftable_[i]->ref_++;
+            if (ftable_[i]->ftype_ == file::ft_pipe) {
+                pipenode* pipe = (pipenode*) ftable_[i]->vnode_;
+                spinlock_guard guard(pipe->lock_);
+                if (ftable_[i]->perm_ & OF_READ){
+                    pipe->readers_++;
+                } else {
+                    pipe->writers_++;
+                }
+            }
+        }
+    }
+
     // enqueue on some CPU's run queue
     cpus[newpid % ncpu].enqueue(newproc);
 
@@ -572,42 +876,34 @@ uintptr_t proc::syscall_read(regstate* regs) {
     // Your code here!
     // * Read from open file `fd` (reg_rdi), rather than `keyboardstate`.
     // * Validate the read buffer.
-    auto& kbd = keyboardstate::get();
-    auto irqs = kbd.lock_.lock();
+    int fd = regs->reg_rdi;
 
-    // mark that we are now reading from the keyboard
-    // (so `q` should not power off)
-    if (kbd.state_ == kbd.boot) {
-        kbd.state_ = kbd.input;
+    if (!sz){
+        return 0;
     }
 
-    // yield until a line is available
-    // (special case: do not block if the user wants to read 0 bytes)
-    while (sz != 0 && kbd.eol_ == 0) {
-        kbd.lock_.unlock(irqs);
-        yield();
-        irqs = kbd.lock_.lock();
+    if (sz > INT32_MAX){
+        return E_FAULT;
     }
 
-    // read that line or lines
-    size_t n = 0;
-    while (kbd.eol_ != 0 && n < sz) {
-        if (kbd.buf_[kbd.pos_] == 0x04) {
-            // Ctrl-D means EOF
-            if (n == 0) {
-                kbd.consume(1);
-            }
-            break;
-        } else {
-            *reinterpret_cast<char*>(addr) = kbd.buf_[kbd.pos_];
-            ++addr;
-            ++n;
-            kbd.consume(1);
-        }
+    if (fd < 0 || fd >= NFILES){
+        return E_BADF;
     }
 
-    kbd.lock_.unlock(irqs);
-    return n;
+    if (!check(addr,sz, PTE_PWU)){
+        return E_FAULT;
+    }
+
+    file* f = ftable_[fd];
+    if (!f) {
+        return E_BADF;
+    }
+
+    if (!(f->perm_ & OF_READ)) {
+        return E_BADF;
+    }
+
+    return f->vnode_->read(reinterpret_cast<char*>(addr), sz);
 }
 
 uintptr_t proc::syscall_write(regstate* regs) {
@@ -620,16 +916,34 @@ uintptr_t proc::syscall_write(regstate* regs) {
     // Your code here!
     // * Write to open file `fd` (reg_rdi), rather than `consolestate`.
     // * Validate the write buffer.
-    auto& csl = consolestate::get();
-    spinlock_guard guard(csl.lock_);
-    size_t n = 0;
-    while (n < sz) {
-        int ch = *reinterpret_cast<const char*>(addr);
-        ++addr;
-        ++n;
-        console_printf(0x0F00, "%c", ch);
+    int fd = regs->reg_rdi;
+
+    if (!sz){
+        return 0;
     }
-    return n;
+
+    if (sz > INT32_MAX){
+        return E_FAULT;
+    }
+
+    if (fd < 0 || fd >= NFILES){
+        return E_BADF;
+    }
+
+    if (!check(addr, sz, PTE_U | PTE_P)) {
+        return E_FAULT;
+    }
+
+    file* f = ftable_[fd];
+    if (!f) {
+        return E_BADF;
+    }
+
+    if (!(f->perm_ & OF_WRITE)) {
+        return E_BADF;
+    }
+
+    return f->vnode_->write(reinterpret_cast<char* const>(addr), sz);
 }
 
 uintptr_t proc::syscall_readdiskfile(regstate* regs) {
@@ -746,4 +1060,167 @@ void tick() {
     if (kdisplay.load(std::memory_order_relaxed) == KDISPLAY_MEMVIEWER) {
         memshow();
     }
+}
+
+
+size_t keyboardnode::read(char* addr, size_t sz) {
+    keyboardstate& keyboard = keyboardstate::get();
+    spinlock_guard guard(keyboard.lock_);
+
+    // switch to using keyboard for input rather than for commands
+    if (keyboard.state_ == keyboardstate::boot) {
+        keyboard.state_ = keyboardstate::input;
+    }
+
+    if (!sz) {
+        return 0;
+    }
+
+    // block until line is available
+    waiter w;
+    w.block_until(keyboard.waitq_, [&]() -> bool {
+        return keyboard.eol_;
+    }, guard);
+
+    // now read
+    size_t n = 0;
+    while (keyboard.eol_ && n < sz) {
+        if (keyboard.buf_[keyboard.pos_] == 0x04) {
+            // Ctrl-D (end of file)
+            if (!n) {
+                keyboard.consume(1);
+            }
+            break;
+        } else {
+            *(addr++) = keyboard.buf_[keyboard.pos_];
+            n++;
+            keyboard.consume(1);
+        }
+    }
+
+    return n;
+}
+
+
+size_t keyboardnode::write(char const* addr, size_t sz) {
+    consolestate& c = consolestate::get();
+    spinlock_guard guard(c.lock_);
+
+    size_t n = 0;
+    while (n < sz) {
+        char ch = *(addr++);
+        n++;
+        console_printf(0x0F00, "%c", ch);
+    }
+
+    return n;
+}
+
+
+size_t pipenode::read(char* buf, size_t sz) {
+    if (!len_){
+        // trying to read from empty pipe: block until there is something or until nobody is writing to it anymore
+        waiter w;
+        w.block_until(ioq, [&]() -> bool {
+            return len_ || writers_ <= 0;
+        });
+    }
+    if (writers_ <= 0 && !len_) {
+        // never going to be anything if nobody's writing
+        return 0;
+    }
+
+    // actual reading
+    size_t return_value = E_AGAIN;
+    {
+        spinlock_guard guard(lock_);
+
+        if (sz) {
+            size_t pos = 0;
+            while (pos < sz && len_ > 0) {
+                size_t n = min(sz - pos, min(len_, PIPE_SIZE - pos_));
+                memcpy(&buf[pos], &buf_[pos_], n);
+                pos_ = (pos_ + n) % PIPE_SIZE;
+                len_ -= n;
+                pos += n;
+            }
+
+            if (pos) {
+                return_value = pos;
+            }
+        } else {
+            return_value = 0;
+        }
+    }
+
+    spinlock_guard guard(ioq.lock_);
+    for (waiter* w = ioq.q_.front(); w; w= ioq.q_.next(w)) {
+        w->wake();
+    }
+
+    return return_value;
+}
+
+
+size_t pipenode::write(char const* buf, size_t sz) {
+    if(len_ == PIPE_SIZE){
+        // trying to write to a full pipe: block until there is space or until nobody is reading from it anymore
+        waiter w;
+        w.block_until(ioq, [&]() -> bool {
+            return len_ != PIPE_SIZE || readers_ <= 0;
+        });
+    }
+    if (readers_ <= 0) {
+        // writing to somewhere nobody's reading from
+        return E_PIPE;
+    }
+
+    // actual writing
+    size_t return_value = E_AGAIN;
+    {
+        spinlock_guard guard(lock_);
+
+        if (sz) {
+            size_t pos = 0;
+            while (pos < sz && len_ < PIPE_SIZE) {
+                size_t i = (pos_ + len_) % PIPE_SIZE;
+                size_t n = min(sz - pos, PIPE_SIZE - max(i, len_));
+                memcpy(&buf_[i], &buf[pos], n);
+                len_ += n;
+                pos += n;
+            }
+
+            if (pos) {
+                return_value = pos;
+            }
+        } else {
+            return_value = 0;
+        }
+    }
+
+    spinlock_guard guard(ioq.lock_);
+    for (waiter* w = ioq.q_.front(); w; w = ioq.q_.next(w)) {
+        w->wake();
+    }
+
+    return return_value;
+}
+
+
+size_t memnode::read(char* buf, size_t sz) {
+    size_t n = min(sz, memfile_.len_ - offset_);
+    memcpy(buf, memfile_.data_ + offset_, n);
+    offset_ += n;
+    return n;
+}
+
+
+size_t memnode::write(char const* buf, size_t sz) {
+    memfile_.set_length(offset_ + sz);
+    {
+        spinlock_guard guard(memfile_.lock_);
+        memcpy(memfile_.data_ + offset_, buf, sz);
+    }
+    offset_ += sz;
+    return sz;
 }

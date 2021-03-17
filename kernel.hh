@@ -6,6 +6,7 @@
 #include "k-lock.hh"
 #include "k-memrange.hh"
 #include "k-waitstruct.hh"
+#include "file.hh"
 #if CHICKADEE_PROCESS
 #error "kernel.hh should not be used by process code."
 #endif
@@ -21,6 +22,8 @@ struct elf_program;
 //    Functions, constants, and definitions for the kernel.
 
 extern int canary;
+
+#define NFILES 256
 
 // Process descriptor type
 struct __attribute__((aligned(4096))) proc {
@@ -47,10 +50,13 @@ struct __attribute__((aligned(4096))) proc {
     pid_t ppid_;                               // Parent process ID
 
     int home_cpu_;
-    bool interrupted_ = false;
+    std::atomic<bool> interrupted_ = false;
     int exit_status_;
 
     int canary_;
+
+    spinlock ftable_lock_;
+    file* ftable_[NFILES];
 
 
     proc();
@@ -59,7 +65,7 @@ struct __attribute__((aligned(4096))) proc {
     inline bool contains(uintptr_t addr) const;
     inline bool contains(void* ptr) const;
 
-    void init_user(pid_t pid, x86_64_pagetable* pt);
+    void init_user(pid_t pid, x86_64_pagetable* pt, bool keep_ftable = false);
     void init_kernel(pid_t pid, void (*f)());
 
     static int load(proc_loader& ld);
@@ -74,6 +80,7 @@ struct __attribute__((aligned(4096))) proc {
     void wake();
     pid_t waitpid(pid_t pid, int* status = nullptr, int options = 0);
 
+    bool check(uintptr_t addr, size_t sz, int perm);
     inline bool resumable() const;
 
     int syscall_fork(regstate* regs);
@@ -81,6 +88,11 @@ struct __attribute__((aligned(4096))) proc {
     uintptr_t syscall_read(regstate* reg);
     uintptr_t syscall_write(regstate* reg);
     uintptr_t syscall_readdiskfile(regstate* reg);
+    int syscall_open(const char* name, int flags);
+    int syscall_dup2(int old_fd, int new_fd);
+    int syscall_close(int fd);
+    long syscall_pipe();
+    int syscall_execv(const char* pathname, const char* const* argv, int argc);
 
     inline irqstate lock_pagetable_read();
     inline void unlock_pagetable_read(irqstate& irqs);

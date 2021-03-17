@@ -44,4 +44,12 @@ struct wait_queue {
     inline void wake_all();
 };
 
+
+inline waiter::waiter() {
+}
+
+
+inline waiter::~waiter() {
+}
+
 #endif
