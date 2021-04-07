@@ -439,6 +439,14 @@ uintptr_t proc::syscall(regstate* regs) {
         result = syscall_lseek((int) regs->reg_rdi, (off_t) regs->reg_rsi, (int) regs->reg_rdx);
         break;
 
+    case SYSCALL_UNLINK:
+        result = syscall_unlink((const char*) regs->reg_rdi);
+        break;
+
+    case SYSCALL_RENAME:
+        result = syscall_rename((const char*) regs->reg_rdi, (const char*) regs->reg_rsi);
+        break;
+
     default:
         // no such system call
         log_printf("%d: no such system call %u\n", id_, regs->reg_rax);
@@ -521,6 +529,126 @@ int inode_cleanup(chkfs::inode* inode) {
     fbb->put();
     b->put_write();
     inode->unlock_write();
+    return 0;
+}
+
+
+int proc::syscall_unlink(const char* name) {
+    chkfs::inode* inode = chkfsstate::get().lookup_inode(name);
+    if (!inode) {
+        return E_NOENT;
+    }
+
+    inode->lock_write();
+    bcentry* b = inode->entry();
+    b->get_write();
+    inode->nlink--;
+    b->put_write();
+    inode->unlock_write();
+    if (!inode->nlink) {
+        chkfs::inode* dirno = chkfsstate::get().get_inode(1);
+        if (!dirno) {
+            return -E_NOENT;
+        }
+
+        chkfs::inum_t in = 0;
+        chkfs_fileiter it(dirno);
+        bool found = false;
+        for (size_t diroff = 0; !in && !found; diroff += chkfs::blocksize) {
+            if (bcentry* e = it.find(diroff).get_disk_entry()) {
+                size_t bsz = min(dirno->size - diroff, chkfs::blocksize);
+                chkfs::dirent* dirent = reinterpret_cast<chkfs::dirent*>(e->buf_);
+                for (size_t i = 0; i * sizeof(*dirent) < bsz; ++i, ++dirent) {
+                    if (dirent->inum && !strcmp(dirent->name, name)) {
+                        e->get_write();
+                        dirent->inum = 0;
+                        dirent->name[0] = '\0';
+                        found = true;
+                        e->put_write();
+                        break;
+                    }
+                }
+                e->put();
+            } else {
+                return -E_NOENT;
+            }
+        }
+        dirno->put();
+
+        if (!inode->refcount) {
+            return inode_cleanup(inode);
+        }
+    }
+    inode->put();
+    return 0;
+}
+
+
+int proc::syscall_rename(const char* old_name, const char* new_name){
+    chkfs::inode* old_inode = chkfsstate::get().lookup_inode(old_name);
+    chkfs::inode* new_inode = chkfsstate::get().lookup_inode(new_name);
+    if (!old_inode) {
+        return E_NOENT;
+    }
+
+    chkfs::inode* dirno = chkfsstate::get().get_inode(1);
+    if (!dirno) {
+        return -E_NOENT;
+    }
+
+    chkfs::inum_t in = 0;
+    chkfs_fileiter it(dirno);
+    bool found = false;
+    if (new_inode) {
+        bcentry* new_inode_bcentry = new_inode->entry();
+        new_inode_bcentry->get_write();
+        new_inode->nlink = 0;
+        new_inode->type = 0;
+        new_inode->size = 0;
+        new_inode_bcentry->put_write();
+        for (size_t diroff = 0; !in && !found; diroff += chkfs::blocksize) {
+            if (bcentry* e = it.find(diroff).get_disk_entry()) {
+                size_t bsz = min(dirno->size - diroff, chkfs::blocksize);
+                chkfs::dirent* dirent = reinterpret_cast<chkfs::dirent*>(e->buf_);
+                for (size_t i = 0; i * sizeof(*dirent) < bsz; ++i, ++dirent) {
+                    if (dirent->inum && !strcmp(dirent->name, new_name)) {
+                        e->get_write();
+                        dirent->name[0] = '\0';
+                        dirent->inum = 0;
+                        found = true;
+                        e->put_write();
+                        break;
+                    }
+                }
+                e->put();
+            } else {
+                return -E_NOENT;
+            }
+        }
+
+        if (!new_inode->refcount){
+            inode_cleanup(new_inode);
+        }
+    }
+    found = false;
+    for (size_t diroff = 0; !in && !found; diroff += chkfs::blocksize) {
+        if (bcentry* e = it.find(diroff).get_disk_entry()) {
+            size_t bsz = min(dirno->size - diroff, chkfs::blocksize);
+            chkfs::dirent* dirent = reinterpret_cast<chkfs::dirent*>(e->buf_);
+            for (size_t i = 0; i * sizeof(*dirent) < bsz; ++i, ++dirent) {
+                if (dirent->inum && !strcmp(dirent->name, old_name)) {
+                    e->get_write();
+                    strncpy(dirent->name, new_name, chkfs::maxnamelen);
+                    found = true;
+                    e->put_write();
+                    break;
+                }
+            }
+            e->put();
+        } else {
+            return -E_NOENT;
+        }
+    }
     return 0;
 }
 

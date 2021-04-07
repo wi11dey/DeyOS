@@ -93,6 +93,8 @@ struct __attribute__((aligned(4096))) proc {
     long syscall_pipe();
     int syscall_execv(const char* pathname, const char* const* argv, int argc);
     int syscall_lseek(int fd, off_t off, int flag);
+    int syscall_unlink(const char* name);
+    int syscall_rename(const char* old_name, const char* new_name);
 
     inline irqstate lock_pagetable_read();
     inline void unlock_pagetable_read(irqstate& irqs);

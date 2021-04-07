@@ -7,4 +7,4 @@ Hao Wang
 
 Citations
 ---------
-(Other sources consulted)
+POSIX manpages for unlink and rename

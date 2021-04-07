@@ -26,5 +26,9 @@ recently used ones. When none of the slots are clean with a refcount of
 zero, only the LRU dirty block will synced to disk and then evicted from
 the cache.
 
+### Optional
+ - `sys_unlink` has been implemented, and `make cleanfs run-testwritefs4 fsck` passes. A `p-testunlink.cc` program has also been added for good measure.
+ - `sys_rename` has been implemented, and a `p-testrename.cc` testing program has been added, which passes.
+
 Grading notes
 -------------
