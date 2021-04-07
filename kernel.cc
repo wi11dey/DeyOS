@@ -34,7 +34,7 @@ static void boot_process_start(pid_t pid, const char* program_name);
 
 void init() {
     while (true) {
-        if (current()->waitpid(0) == E_CHILD) {
+        if (current()->syscall_waitpid(0) == E_CHILD) {
             process_halt();
         }
     }
@@ -61,10 +61,10 @@ void kernel_start(const char* command) {
         spinlock_guard guard(ptable_lock);
         ptable[1] = initproc;
     }
-    cpus[0].enqueue(initproc);
 
     // start first process
     boot_process_start(2, CHICKADEE_FIRST_PROCESS);
+    cpus[0].enqueue(initproc);
 
     // start running processes
     cpus[0].schedule(nullptr);
@@ -321,7 +321,7 @@ uintptr_t proc::syscall(regstate* regs) {
 
     case SYSCALL_WAITPID: {
         int status;
-        pid_t pid = waitpid(regs->reg_rdi, &status, regs->reg_rsi);
+        pid_t pid = syscall_waitpid(regs->reg_rdi, &status, regs->reg_rsi);
         result = pid | (((unsigned long) status) << 32);
         break;        
     }
@@ -435,6 +435,10 @@ uintptr_t proc::syscall(regstate* regs) {
         result = test_kalloc();
         break;
 
+    case SYSCALL_LSEEK:
+        result = syscall_lseek((int) regs->reg_rdi, (off_t) regs->reg_rsi, (int) regs->reg_rdx);
+        break;
+
     default:
         // no such system call
         log_printf("%d: no such system call %u\n", id_, regs->reg_rax);
@@ -453,6 +457,74 @@ uintptr_t proc::syscall(regstate* regs) {
 }
 
 
+int inode_cleanup(chkfs::inode* inode) {
+    inode->lock_write();
+    bcentry* b = inode->entry();
+    bufcache& bc = bufcache::get();
+    bcentry* superblock_entry = bc.get_disk_entry(0);
+    assert(superblock_entry);
+    chkfs::superblock& sb = *reinterpret_cast<chkfs::superblock*>(&superblock_entry->buf_[chkfs::superblock_offset]);
+    superblock_entry->put();
+    chkfs::blocknum_t bn =  sb.fbb_bn;
+    b->get_write();
+    bcentry* fbb = bc.get_disk_entry(bn);
+    fbb->get_write();
+    bitset_view bitmap = bitset_view((uint64_t*) fbb->buf_, (size_t) chkfs::blocksize << 3);
+
+    // direct
+    inode->type = 0;
+    inode->size = 0;
+    for (unsigned int i = 0; i < chkfs::ndirect; i++) {
+        if (inode->direct[i].count != 0) {
+            if (fbb == nullptr) {
+                // wtf
+                b->put_write();
+                fbb->put_write();
+                fbb->put();
+                inode->unlock_write();
+                return -1;
+            }
+            for (int j = 0; j< (int)(inode->direct[i].count); j++) {
+                bitmap[inode->direct[i].first + j] = 1;
+            }
+            inode->direct[i].count = 0;
+            inode->direct[i].first = -1;
+        }
+    }
+
+    // indirect
+    if (inode->indirect.count != 0) {
+        for (unsigned int j = 0; j < inode->indirect.count; j++) {
+            bcentry* indirect_entry = bc.get_disk_entry(inode->indirect.first + j);
+            if (!indirect_entry) {
+                b->put_write();
+                fbb->put_write();
+                fbb->put();
+                inode->unlock_write();
+                return -1;
+            }
+            indirect_entry->get_write();
+            chkfs::extent* eptr = (chkfs::extent*) indirect_entry->buf_;
+            while (eptr->count) {
+                for (unsigned int k = 0; k<eptr->count; k++) {
+                    bitmap[eptr->first + k] = 1;
+                }
+                eptr->count = 0;
+                eptr++;
+            }
+            indirect_entry->put_write();
+            indirect_entry->put();
+        }
+    }
+
+    fbb->put_write();
+    fbb->put();
+    b->put_write();
+    inode->unlock_write();
+    return 0;
+}
+
+
 bool proc::check(uintptr_t addr, size_t sz, int perm) {
     if (!addr){
         return false;
@@ -468,20 +540,112 @@ bool proc::check(uintptr_t addr, size_t sz, int perm) {
 }
 
 
+int find_inode() {
+    bufcache& bc = bufcache::get();
+    bcentry* superblock_entry = bc.get_disk_entry(0);
+    assert(superblock_entry);
+    chkfs::superblock& sb = *reinterpret_cast<chkfs::superblock*>(&superblock_entry->buf_[chkfs::superblock_offset]);
+    superblock_entry->put();
+    chkfs::blocknum_t bn =  sb.inode_bn;
+    int i = 0;
+    bcentry* e = bc.get_disk_entry(bn);
+    while (e != nullptr && bn < sb.nblocks) {
+        for (chkfs::inode* inode_ = (chkfs::inode*) e->buf_; (uint64_t) inode_ < (uint64_t) e->buf_ + chkfs::blocksize; inode_++, i++){
+            if (!inode_->type && i){
+                inode_->lock_write();
+                e->get_write();
+                inode_->type = 1;
+                inode_->nlink = 1;
+                inode_->mbcindex = e->index();
+                e->put_write();
+                chkfs_fileiter it(inode_);
+                chkfs::blocknum_t start = chkfsstate::get().allocate_extent(1);
+                it.insert(start, 1);
+                e->put();
+                inode_->unlock_write();
+                return i;
+            }
+        }
+        bn++;
+        e = bc.get_disk_entry(bn);
+    }
+    return -1;
+}
+
+
+int create_file(const char* name) {
+    chkfs::inode* dirno = chkfsstate::get().get_inode(1);
+    if (dirno) {
+        dirno->lock_write();
+        chkfs_fileiter it(dirno);
+        chkfs::inum_t in = 0;
+        for (size_t diroff = 0; !in; diroff += chkfs::blocksize) {
+            if (bcentry* e = it.find(diroff).get_disk_entry()) {
+                size_t bsz = min(dirno->size - diroff, chkfs::blocksize);
+                chkfs::dirent* dirent = reinterpret_cast<chkfs::dirent*>(e->buf_);
+                for (unsigned i = 0; i * sizeof(*dirent) < bsz; ++i, ++dirent) {
+                    if (!dirent->inum) {
+                        e->get_write();
+                        strncpy(dirent->name, name, chkfs::maxnamelen);
+                        dirent->inum = find_inode();
+                        if (dirent->inum < 0) {
+                            e->put_write();
+                            e->put();
+                            dirno->unlock_write();
+                            return -1;
+                        }
+                        e->put_write();
+                        e->put();
+                        dirno->unlock_write();
+                        return dirent->inum;
+                    }
+                }
+                e->put();
+            } else {
+                // need to create extent for dir inode
+                chkfs::blocknum_t start = chkfsstate::get().allocate_extent(1);
+                if (start >= chkfs::blocknum_t(E_MINERROR)) {
+                    return E_NOSPC;
+                }
+                it.insert(start, 1);
+                diroff -= chkfs::blocksize;
+            }
+        }
+    } else {
+        return E_NOENT;
+    }
+    return 0;
+}
+
+
 int proc::syscall_open(const char* name, int flags) {
     if (!check((uintptr_t) name, memfile::namesize, PTE_PWU)) {
         return E_FAULT;
     }
 
-    if(!memfile::check_path(name)){
-        return E_INVAL;
+    chkfs::inode* inode = chkfsstate::get().lookup_inode(name);
+    if (!inode) {
+        if (flags & OF_CREATE && flags & OF_WRITE) {
+            int status = create_file(name);
+            if (status < 0) {
+                return status;
+            }
+            inode = chkfsstate::get().lookup_inode(name);
+            assert(inode);
+        } else {
+            return E_NOENT;
+        }
     }
 
-    int index = memfile::initfs_lookup(name, flags & OF_CREATE);
-    if (flags & OF_TRUNC) {
-        spinlock_guard guard(memfile::initfs[index].lock_);
-        memfile::initfs[index].len_ = 0;
+    bcentry* e = inode->entry();
+    chkfsstate::get().prefetch(inode, 0);
+    e->get_write();
+    inode->refcount++;
+
+    if (flags & OF_TRUNC && flags & OF_WRITE) {
+        inode->size = 0;
     }
+    e->put_write();
 
     spinlock_guard ftable_guard(ftable_lock_);
     int fd;
@@ -495,12 +659,59 @@ int proc::syscall_open(const char* name, int flags) {
         }
     }
 
-    memfile& memfile = memfile::initfs[index];
-    file* f = knew<file>(file::ft_memfile, flags, knew<memnode>(memfile, (flags & OF_WRITE) ? memfile.len_ : 0));
+    file* f = knew<file>(file::ft_diskfile, flags, knew<disknode>(inode));
     ftable_[fd] = f;
     f->ref_++;
 
     return fd;
+}
+
+
+int proc::syscall_lseek(int fd, off_t off, int flag) {
+    file* f = ftable_[fd];
+    spinlock_guard guard(f->lock_);
+
+    size_t sz = 0;
+    switch (f->ftype_) {
+    case file::ft_memfile:
+        sz = static_cast<memnode*>(f->vnode_)->memfile_.len_;
+        break;
+
+    case file::ft_diskfile:
+        sz = static_cast<disknode*>(f->vnode_)->inode_->size;
+        break;
+
+    default:
+        return E_SPIPE;
+    }
+
+    seekable* node = static_cast<seekable*>(f->vnode_);
+    switch (flag) {
+    case LSEEK_SET:
+        node->offset_ = off;
+        break;
+
+    case LSEEK_CUR: {
+        off_t try_offset = node->offset_ + off;
+        if (try_offset < 0 || size_t(try_offset) > sz) {
+            return E_INVAL;
+        }
+        node->offset_ = try_offset;
+        break;
+    }
+
+    case LSEEK_END:
+        node->offset_ = sz;
+        break;
+
+    case LSEEK_SIZE:
+        return sz;
+
+    default:
+        return E_FAULT;
+    }
+
+    return node->offset_;
 }
 
 
@@ -556,7 +767,7 @@ int proc::syscall_close(int fd) {
 
     bool free_pipe = false;
     if (file->ftype_ == file::ft_pipe) {
-        pipenode* pipe = (pipenode*) file->vnode_;
+        pipenode* pipe = static_cast<pipenode*>(file->vnode_);
         spinlock_guard pipe_guard(pipe->lock_);
         if (file->perm_ & OF_READ) {
             pipe->readers_--;
@@ -566,6 +777,18 @@ int proc::syscall_close(int fd) {
         if (pipe->readers_ <= 0 && pipe->writers_ <= 0) {
             free_pipe = true;
         }
+    } else if (file->ftype_ == file::ft_diskfile) {
+        chkfs::inode* inode = static_cast<disknode*>(file->vnode_)->inode_;
+        bcentry* b = inode->entry();
+        inode->lock_write();
+        b->get_write();
+        inode->refcount--;
+        b->put_write();
+        inode->unlock_write();
+        if (!inode->refcount && !inode->nlink) {
+            inode_cleanup(inode);
+        }
+        inode->put();
     }
 
     {
@@ -582,9 +805,7 @@ int proc::syscall_close(int fd) {
         file = nullptr;
     }
 
-    for (waiter* w = ioq.q_.front(); w; w=ioq.q_.next(w)) {
-        w->wake();
-    }
+    ioq.wake_all();
 
     return 0;
 }
@@ -626,10 +847,6 @@ int proc::syscall_dup2(int old_fd, int new_fd) {
 
 
 int proc::syscall_execv(const char* pathname, const char* const* argv, int argc){
-    if (!memfile::check_path(pathname)) {
-        return E_INVAL;
-    }
-
     if (argc <= 0) {
         return E_INVAL;
     }
@@ -640,19 +857,16 @@ int proc::syscall_execv(const char* pathname, const char* const* argv, int argc)
         }
     }
 
-    int mindex = memfile::initfs_lookup(pathname, false);
-    if (mindex < 0){
-        return E_NOENT;
+    if (!sata_disk) {
+        return E_IO;
     }
 
     x86_64_pagetable* old_pagetable = pagetable_;
     x86_64_pagetable* pagetable = kalloc_pagetable();
 
-    memfile_loader ld(mindex, pagetable);
-    if (ld.memfile_ == nullptr || ld.pagetable_ == nullptr) {
-        kfree(ld.memfile_);
-        kfree(ld.pagetable_);
-        return E_NOMEM;
+    diskfile_loader ld(pathname, pagetable);
+    if (!ld.inode_) {
+        return E_NOENT;
     }
 
     int r = proc::load(ld);
@@ -664,7 +878,6 @@ int proc::syscall_execv(const char* pathname, const char* const* argv, int argc)
         || vmiter(pagetable, MEMSIZE_VIRTUAL - PAGESIZE).try_map(stack, PTE_PWU) < 0){
         kfree(stack);
         kfree(ld.pagetable_);
-        kfree(ld.memfile_);
         return E_NOMEM;
     }
 
@@ -700,7 +913,7 @@ int proc::syscall_execv(const char* pathname, const char* const* argv, int argc)
     return 0;
 }
 
-pid_t proc::waitpid(pid_t pid, int* status, int options) {
+pid_t proc::syscall_waitpid(pid_t pid, int* status, int options) {
     // ensure valid process ID
     if (pid < 0 && pid >= NPROC) {
         return E_INVAL;
@@ -728,7 +941,7 @@ pid_t proc::waitpid(pid_t pid, int* status, int options) {
         w.block_until(waitpidq, [&, pid, options, child]() mutable -> bool {
             if (pid) {
                 if (ptable[pid]->pstate_ == ps_broken) {
-                    zombie = child;
+                    zombie = ptable[pid];
                 }
             } else {
                 // wait for any child
@@ -740,7 +953,7 @@ pid_t proc::waitpid(pid_t pid, int* status, int options) {
                 }
             }
 
-            return zombie || options & W_NOHANG;
+            return zombie || (options & W_NOHANG);
         }, guard);
     }
     assert(options & W_NOHANG || zombie->pstate_ == ps_broken);
@@ -765,6 +978,7 @@ pid_t proc::waitpid(pid_t pid, int* status, int options) {
 int proc::syscall_fork(regstate* regs) {
     pid_t newpid = 0;
     proc* newproc = nullptr;
+    x86_64_pagetable* newpagetable = nullptr;
     {
         // lock the process table for the duration of this block
         spinlock_guard guard(ptable_lock);
@@ -786,27 +1000,26 @@ int proc::syscall_fork(regstate* regs) {
         if (!newproc) {
             return E_NOMEM;
         }
-        // rest of function is working on the process itself, so can let go of ptable lock now
+
+        // allocate pagetable
+        newpagetable = newproc->pagetable_ = kalloc_pagetable();
+        if (!newpagetable) {
+            ptable[newpid] = nullptr;
+            kfree(newproc);
+            return E_NOMEM;
+        }
+
         newproc->pstate_ = ps_broken;
         newproc->ppid_ = id_;
         children_.push_back(newproc);
-    }
 
-    // allocate pagetable
-    x86_64_pagetable* newpagetable = newproc->pagetable_ = kalloc_pagetable();
-    if (!newpagetable) {
-        spinlock_guard guard(ptable_lock);
-        ptable[newpid] = nullptr;
-        kfree(newproc);
-        return E_NOMEM;
+        // initialize userspace process
+        newproc->init_user(newpid, newpagetable);
+        // initialize new process' registers to copy of old process' registers
+        *newproc->regs_ = *regs;
+        // new process gets 0 as return value
+        newproc->regs_->reg_rax = 0;
     }
-
-    // initialize userspace process
-    newproc->init_user(newpid, newpagetable);
-    // initialize new process' registers to copy of old process' registers
-    *newproc->regs_ = *regs;
-    // new process gets 0 as return value
-    newproc->regs_->reg_rax = 0;
 
     // map copies of parent's user-accessible memory into new process' page table
     for (vmiter parent(this); parent.low(); ) {
@@ -1102,7 +1315,7 @@ size_t keyboardnode::read(char* addr, size_t sz) {
 }
 
 
-size_t keyboardnode::write(char const* addr, size_t sz) {
+size_t keyboardnode::write(const char* addr, size_t sz) {
     consolestate& c = consolestate::get();
     spinlock_guard guard(c.lock_);
 
@@ -1153,16 +1366,13 @@ size_t pipenode::read(char* buf, size_t sz) {
         }
     }
 
-    spinlock_guard guard(ioq.lock_);
-    for (waiter* w = ioq.q_.front(); w; w= ioq.q_.next(w)) {
-        w->wake();
-    }
+    ioq.wake_all();
 
     return return_value;
 }
 
 
-size_t pipenode::write(char const* buf, size_t sz) {
+size_t pipenode::write(const char* buf, size_t sz) {
     if(len_ == PIPE_SIZE){
         // trying to write to a full pipe: block until there is space or until nobody is reading from it anymore
         waiter w;
@@ -1215,7 +1425,7 @@ size_t memnode::read(char* buf, size_t sz) {
 }
 
 
-size_t memnode::write(char const* buf, size_t sz) {
+size_t memnode::write(const char* buf, size_t sz) {
     memfile_.set_length(offset_ + sz);
     {
         spinlock_guard guard(memfile_.lock_);
@@ -1223,4 +1433,68 @@ size_t memnode::write(char const* buf, size_t sz) {
     }
     offset_ += sz;
     return sz;
+}
+
+
+size_t disknode::read(char* buf, size_t sz) {
+    inode_->lock_read();
+    chkfs_fileiter it(inode_);
+    size_t nread = 0;
+    while (nread < sz) {
+        chkfsstate::get().prefetch(inode_, offset_ + chkfs::blocksize);
+        if (bcentry* e = it.find(offset_).get_disk_entry()) {
+            unsigned b = it.block_relative_offset();
+            size_t n = min(size_t(inode_->size - it.offset()), chkfs::blocksize - b, sz - nread);
+            memcpy(buf + nread, e->buf_ + b, n);
+            e->put();
+
+            nread += n;
+            offset_+= n;
+            if (!n) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    inode_->unlock_read();
+
+    return nread;
+}
+
+
+size_t disknode::write(const char* buf, size_t sz) {
+    chkfs_fileiter it(inode_);
+    size_t nwrite = 0;
+    inode_->lock_write();
+    while (nwrite < sz) {
+        chkfsstate::get().prefetch(inode_, offset_ + chkfs::blocksize);
+        if (bcentry* e = it.find(offset_).get_disk_entry()) {
+            unsigned b = it.block_relative_offset();
+            size_t n = min(chkfs::blocksize - b, sz - nwrite);
+            e->get_write();
+            memcpy(e->buf_ + b, buf + nwrite, n);
+            e->put_write();
+            e->put();
+
+            nwrite += n;
+            offset_ += n;
+            inode_->size = max((uint32_t) offset_, inode_->size);
+            if (!n) {
+                break;
+            }
+        } else {
+            chkfs::blocknum_t start = chkfsstate::get().allocate_extent(1);
+            it.insert(start, 1);
+        }
+    }
+    if(offset_ > inode_->size){
+        bcentry* b = inode_->entry();
+        b->get_write();
+        inode_->size = offset_;
+        b->put_write();
+    }
+    inode_->unlock_write();
+
+    return nwrite;
 }

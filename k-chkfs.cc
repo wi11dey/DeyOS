@@ -3,6 +3,9 @@
 #include "k-chkfsiter.hh"
 
 bufcache bufcache::bc;
+wait_queue diskq;
+list<bcentry, &bcentry::links_> dirty_list;
+spinlock dirty_lock;
 
 bufcache::bufcache() {
 }
@@ -19,31 +22,79 @@ bufcache::bufcache() {
 //    Returns `nullptr` if there's no room for the block.
 
 bcentry* bufcache::get_disk_entry(chkfs::blocknum_t bn,
-                                  bcentry_clean_function cleaner) {
+                                  bcentry_clean_function cleaner, bool noblock) {
     assert(chkfs::blocksize == PAGESIZE);
     auto irqs = lock_.lock();
 
     // look for slot containing `bn`
     size_t i, empty_slot = -1;
+    // LRU eviction policy
+    size_t evict = -1,
+        evict_dirty = -1;
+    unsigned long lru_time = -1,
+        lru_dirty_time = -1;
     for (i = 0; i != ne; ++i) {
         if (e_[i].empty()) {
             if (empty_slot == size_t(-1)) {
                 empty_slot = i;
             }
-        } else if (e_[i].bn_ == bn) {
-            break;
+        } else {
+            if (e_[i].bn_ == bn) {
+                break;
+            } else if (e_[i].ref_ == 0 && e_[i].bn_ != 0 && e_[i].bn_ != 1) {
+                if (e_[i].estate_ != bcentry::es_dirty) {
+                    if (evict == size_t(-1)) {
+                        evict = i;
+                        lru_time = e_[i].ref_time_;
+                    } else if (e_[i].ref_time_ < lru_time) {
+                        lru_time = e_[i].ref_time_;
+                        evict = i;
+                    }
+                } else {
+                    // dirty state
+                    if (evict_dirty == size_t(-1)) {
+                        evict_dirty = i;
+                        lru_dirty_time = e_[i].ref_time_;
+                    } else if (e_[i].ref_time_ < lru_dirty_time) {
+                        lru_dirty_time = e_[i].ref_time_;
+                        evict_dirty = i;
+                    }
+                }
+            }
         }
     }
 
-    // if not found, use free slot
     if (i == ne) {
-        if (empty_slot == size_t(-1)) {
-            // cache full!
-            lock_.unlock(irqs);
-            log_printf("bufcache: no room for block %u\n", bn);
-            return nullptr;
+        // fine, get a free slot
+        if (empty_slot == size_t(-1) && evict != size_t(-1)) {
+            // evict :D
+            empty_slot = evict;
+            e_[evict].lock_.lock_noirq();
+            e_[evict].estate_ = bcentry::es_empty;
+            e_[evict].lock_.unlock_noirq();
+        } else if (empty_slot == size_t(-1) && evict_dirty != size_t(-1) && !noblock) {
+            e_[evict_dirty].get_write();
+            lock_.unlock(irqs); 
+
+            sata_disk->write(e_[evict_dirty].buf_, chkfs::blocksize, chkfs::blocksize*e_[evict_dirty].bn_, nullptr);
+            irqs = lock_.lock();
+            {
+                spinlock_guard guard(e_[evict_dirty].lock_);
+                e_[evict_dirty].estate_ = bcentry::es_empty;
+            
+                if(e_[evict_dirty].links_.is_linked()){
+                    spinlock_guard dirty_guard(dirty_lock);
+                    dirty_list.erase(&e_[evict_dirty]);
+                }
+            }
+            e_[evict_dirty].put_write();
+            empty_slot = evict_dirty;
         }
         i = empty_slot;
+    }
+
+    if (i == ne) { // still
+        return nullptr;
     }
 
     // obtain entry lock
@@ -59,15 +110,18 @@ bcentry* bufcache::get_disk_entry(chkfs::blocknum_t bn,
     lock_.unlock_noirq();
 
     // mark reference
-    ++e_[i].ref_;
+    if (!noblock) {
+        e_[i].ref_++;
+    }
 
     // load block
-    bool ok = e_[i].load(irqs, cleaner);
+    bool ok = e_[i].load(irqs, cleaner, noblock);
 
     // unlock and return entry
-    if (!ok) {
-        --e_[i].ref_;
+    if (!ok && !noblock) {
+        e_[i].ref_--;
     }
+    e_[i].ref_time_ = ticks.load();
     e_[i].lock_.unlock(irqs);
     return ok ? &e_[i] : nullptr;
 }
@@ -78,13 +132,14 @@ bcentry* bufcache::get_disk_entry(chkfs::blocknum_t bn,
 //    locked, that `estate_ >= es_allocated`, and that `bn_` is set to the
 //    desired block number.
 
-bool bcentry::load(irqstate& irqs, bcentry_clean_function cleaner) {
+bool bcentry::load(irqstate& irqs, bcentry_clean_function cleaner, bool noblock) {
     bufcache& bc = bufcache::get();
 
     // load block, or wait for concurrent reader to load it
     while (true) {
         assert(estate_ != es_empty);
-        if (estate_ == es_allocated) {
+        switch (estate_) {
+        case es_allocated:
             if (!buf_) {
                 buf_ = reinterpret_cast<unsigned char*>
                     (kalloc(chkfs::blocksize));
@@ -92,23 +147,40 @@ bool bcentry::load(irqstate& irqs, bcentry_clean_function cleaner) {
                     return false;
                 }
             }
-            estate_ = es_loading;
-            lock_.unlock(irqs);
-
-            sata_disk->read(buf_, chkfs::blocksize,
-                            bn_ * chkfs::blocksize);
-
-            irqs = lock_.lock();
+            if (noblock) {
+                lock_.unlock(irqs);
+                int r = sata_disk->read(buf_, chkfs::blocksize, bn_ * chkfs::blocksize, &fetch_status_);
+                estate_ = r < 0 ? es_allocated : es_prefetch;
+                irqs = lock_.lock();
+                return r >= 0;
+            } else {
+                estate_ = es_loading;
+                lock_.unlock(irqs);
+                sata_disk->read(buf_, chkfs::blocksize, bn_ * chkfs::blocksize, nullptr);
+                irqs = lock_.lock();
+                estate_ = es_clean;
+                if (cleaner) {
+                    cleaner(this);
+                }
+                bc.read_wq_.wake_all();
+            }
+            break;
+        case es_loading:
+            waiter().block_until(bc.read_wq_, [&] () {
+                return estate_ != es_loading;
+            }, lock_, irqs);
+            break;
+        case es_prefetch:
+            waiter().block_until(sata_disk->wq_, [&] () {
+                    return fetch_status_ != E_AGAIN;
+                }, lock_, irqs);
             estate_ = es_clean;
             if (cleaner) {
                 cleaner(this);
             }
             bc.read_wq_.wake_all();
-        } else if (estate_ == es_loading) {
-            waiter().block_until(bc.read_wq_, [&] () {
-                    return estate_ != es_loading;
-                }, lock_, irqs);
-        } else {
+            break;
+        default:
             return true;
         }
     }
@@ -122,9 +194,7 @@ bool bcentry::load(irqstate& irqs, bcentry_clean_function cleaner) {
 void bcentry::put() {
     spinlock_guard guard(lock_);
     assert(ref_ != 0);
-    if (--ref_ == 0) {
-        clear();
-    }
+    ref_--;
 }
 
 
@@ -132,8 +202,19 @@ void bcentry::put() {
 //    Obtains a write reference for this entry.
 
 void bcentry::get_write() {
-    // Your code here
-    assert(false);
+    if (write_ref_) {
+        // wait until no more write references
+        w_.block_until(diskq, [&] () {
+            return !write_ref_;
+        });
+    }
+    spinlock_guard guard(lock_);
+    ++write_ref_;
+    estate_ = es_dirty;
+    if (!links_.is_linked()) {
+        spinlock_guard dirty_guard(dirty_lock);
+        dirty_list.push_back(this);
+    }
 }
 
 
@@ -141,8 +222,11 @@ void bcentry::get_write() {
 //    Releases a write reference for this entry.
 
 void bcentry::put_write() {
-    // Your code here
-    assert(false);
+    {
+        spinlock_guard guard(lock_);
+        write_ref_--;
+    }
+    diskq.wake_all();
 }
 
 
@@ -154,7 +238,26 @@ void bcentry::put_write() {
 
 int bufcache::sync(int drop) {
     // write dirty buffers to disk
-    // Your code here!
+
+    list<bcentry, &bcentry::links_> dirty;
+    // take responsibility for these buffers
+    dirty.swap(dirty_list);
+    while (bcentry* e = dirty.pop_front()) {
+        if (!e->buf_) {
+            continue;
+        }
+
+        e->get_write();
+        sata_disk->write(e->buf_, chkfs::blocksize, chkfs::blocksize * e->bn_, nullptr);
+        {
+            spinlock_guard guard(e->lock_);
+            e->estate_ = e->es_clean;
+        }
+        e->put_write();
+        if (!e->ref_) {
+            e->clear();
+        }
+    } 
 
     // drop clean buffers if requested
     if (drop > 0) {
@@ -308,6 +411,14 @@ void inode::put() {
 }
 }
 
+void chkfsstate::prefetch(inode* inode, off_t off){
+    // Prefetch next block
+    chkfs_fileiter it(inode);
+    blocknum_t bn = it.find(off).blocknum();
+    bufcache& bc = bufcache::get();
+    bc.get_disk_entry(bn, nullptr, true);
+}
+
 
 // chkfsstate::lookup_inode(dirino, filename)
 //    Looks up `filename` in the directory inode `dirino`, returning the
@@ -366,6 +477,21 @@ chkfs::inode* chkfsstate::lookup_inode(const char* filename) {
 //    `blocknum >= blocknum_t(E_MINERROR)`.
 
 auto chkfsstate::allocate_extent(unsigned count) -> blocknum_t {
-    // Your code here
-    return E_INVAL;
+    bufcache& bc = bufcache::get();
+    bcentry* superblock_entry = bc.get_disk_entry(0);
+    assert(superblock_entry);
+    chkfs::superblock& sb = *reinterpret_cast<chkfs::superblock*>(superblock_entry->buf_ + chkfs::superblock_offset);
+    superblock_entry->put();
+    chkfs::blocknum_t bn =  sb.fbb_bn;
+    bcentry* fbb = bc.get_disk_entry(bn);
+    if (!fbb) {
+        return E_NOENT;
+    }
+    fbb->get_write();
+    bitset_view bitmap = bitset_view((uint64_t*) fbb->buf_, (size_t) chkfs::blocksize << 3);
+    blocknum_t start_extent = bitmap.find_lsb(0);
+    bitmap[start_extent] = 0;
+    fbb->put_write();
+    fbb->put();
+    return start_extent;
 }

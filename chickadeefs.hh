@@ -60,13 +60,13 @@ struct extent {
 };
 
 struct inode {
-    uint32_t type;                // file type (regular, directory, or 0/none)
-    uint32_t size;                // file size
-    uint32_t nlink;               // # hard links to file
-    uint32_t flags;               // flags (currently unused)
-    std::atomic<mlock_t> mlock;   // used in memory, 0 when loaded from disk
-    uint32_t mbcindex;            // used in memory, 0 when loaded from disk
-    extent direct[ndirect];       // extents
+    uint32_t type;                  // file type (regular, directory, or 0/none)
+    uint32_t size;                  // file size
+    uint32_t nlink;                 // # hard links to file
+    std::atomic<uint32_t> refcount; // runtime refcount
+    std::atomic<mlock_t> mlock;     // used in memory, 0 when loaded from disk
+    uint32_t mbcindex;              // used in memory, 0 when loaded from disk
+    extent direct[ndirect];         // extents
     extent indirect;
 
 #ifdef CHICKADEE_KERNEL

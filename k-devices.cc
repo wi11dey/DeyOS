@@ -2,6 +2,7 @@
 #include "k-apic.hh"
 #include "k-wait.hh"
 #include "lib.hh"
+#include "k-chkfsiter.hh"
 
 // k-devices.cc
 //
@@ -352,4 +353,30 @@ ssize_t memfile_loader::get_page(uint8_t** pg, size_t off) {
 
 void memfile_loader::put_page() {
     // no need to do anything
+}
+
+ssize_t diskfile_loader::get_page(uint8_t** pg, size_t off) {
+    if (!inode_) {
+        return E_NOENT;
+    }
+
+    if (off >= inode_->size) {
+        return 0;
+    }
+
+    inode_->lock_read();
+    chkfs_fileiter it(inode_);
+    if (bcentry* e = it.find(off).get_disk_entry()) {
+        e_ = e;
+        unsigned b = it.block_relative_offset();
+        *pg = e->buf_ + b;
+        return min(size_t(inode_->size - it.offset()), chkfs::blocksize - b);
+    }
+
+    return E_IO;
+}
+
+void diskfile_loader::put_page(){
+    e_->put();
+    inode_->unlock_read();
 }

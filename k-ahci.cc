@@ -99,32 +99,54 @@ inline void ahcistate::acknowledge(int slot, int result) {
 //    sector-aligned (i.e., multiples of `ahcistate::sectorsize`).
 //    Can block. Returns 0 on success and an error code on failure.
 
-int ahcistate::read_or_write(idecommand command, void* buf, size_t sz,
-                             size_t off) {
+int ahcistate::read_or_write_nonblocking(idecommand command, void* buf, size_t sz, size_t off, std::atomic_int& fetch_status) {
     // `sz` and `off` must be sector-aligned
     assert(sz % sectorsize == 0 && off % sectorsize == 0);
 
-    // obtain lock
-    auto irqs = lock_.lock();
-
-    // block until ready for command
+    if (!buf) {
+        return E_INVAL;
+    }
     waiter().block_until(wq_, [&] () {
-            return !slots_outstanding_mask_;
-        }, lock_, irqs);
+        // wait before obtaining lock
+        return nslots_available_;
+    });
+    // obtain lock
+    spinlock_guard guard(lock_);
+
+    int slot = lsb(~slots_outstanding_mask_);
+    if (!slot) {
+        return E_AGAIN;
+    }
+    slot--;
 
     // send command, record buffer and status storage
-    std::atomic<int> r = E_AGAIN;
-    clear(0);
-    push_buffer(0, buf, sz);
-    issue_ncq(0, command, off / sectorsize);
-    slot_status_[0] = &r;
+    fetch_status = E_AGAIN;
+    clear(slot);
+    push_buffer(slot, buf, sz);
+    issue_ncq(slot, command, off / sectorsize);
+    slot_status_[slot] = &fetch_status;
 
-    lock_.unlock(irqs);
+    return 0;
+}
 
+
+// ahcistate::read_or_write(command, buf, sz, off)
+//    Issue an NCQ read or write command `command`. Read or write
+//    `sz` bytes of data to or from `buf`, starting at disk offset
+//    `off`. `sz` and `off` are measured in bytes, but must be
+//    sector-aligned (i.e., multiples of `ahcistate::sectorsize`).
+//    Can block. Returns 0 on success and an error code on failure.
+
+int ahcistate::read_or_write(idecommand command, void* buf, size_t sz,
+                             size_t off) {
+    std::atomic<int> r;
+    if (int err = read_or_write_nonblocking(command, buf, sz, off, r)) {
+        return err;
+    }
     // wait for response
     waiter().block_until(wq_, [&] () {
-            return r != E_AGAIN;
-        });
+        return r != E_AGAIN;
+    });
     return r;
 }
 

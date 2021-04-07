@@ -5,6 +5,7 @@
 #include "k-lock.hh"
 #include "k-wait.hh"
 
+extern wait_queue diskq;
 // buffer cache
 
 using bcentry_clean_function = void (*)(bcentry*);
@@ -13,15 +14,21 @@ struct bcentry {
     using blocknum_t = chkfs::blocknum_t;
 
     enum estate_t {
-        es_empty, es_allocated, es_loading, es_clean
+        es_empty, es_allocated, es_loading, es_clean, es_dirty, es_prefetch
     };
 
     std::atomic<int> estate_ = es_empty;
 
+    waiter w_;
     spinlock lock_;                      // protects most `estate_` changes
     blocknum_t bn_;                      // disk block number (unless empty)
     unsigned ref_ = 0;                   // reference count
+    unsigned write_ref_ = 0;
     unsigned char* buf_ = nullptr;       // memory buffer used for entry
+    unsigned long ref_time_ = 0;
+    std::atomic<int> fetch_status_;
+    list_links links_;
+    bool flush = false;
 
 
     // return the index of this entry in the buffer cache
@@ -33,6 +40,9 @@ struct bcentry {
     // test if this entry's memory buffer contains a pointer
     inline bool contains(const void* ptr) const;
 
+    // test if this entry is dirty
+    inline bool dirty() const;
+
     // release the caller's reference
     void put();
 
@@ -43,7 +53,7 @@ struct bcentry {
 
     // internal functions
     void clear();
-    bool load(irqstate& irqs, bcentry_clean_function cleaner);
+    bool load(irqstate& irqs, bcentry_clean_function cleaner, bool noblock);
 };
 
 struct bufcache {
@@ -59,7 +69,8 @@ struct bufcache {
     static inline bufcache& get();
 
     bcentry* get_disk_entry(blocknum_t bn,
-                            bcentry_clean_function cleaner = nullptr);
+                            bcentry_clean_function cleaner = nullptr,
+                            bool noblock = false);
 
     int sync(int drop);
 
@@ -93,6 +104,8 @@ struct chkfsstate {
 
     blocknum_t allocate_extent(unsigned count = 1);
 
+    void prefetch(inode* inode, off_t off);
+
 
   private:
     static chkfsstate fs;
@@ -120,10 +133,14 @@ inline bool bcentry::empty() const {
     return estate_.load(std::memory_order_relaxed) == es_empty;
 }
 
+inline bool bcentry::dirty() const {
+    return estate_.load(std::memory_order_relaxed) == es_dirty;
+}
+
 inline bool bcentry::contains(const void* ptr) const {
     return estate_.load(std::memory_order_relaxed) >= es_clean
         && reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(buf_)
-               < chkfs::blocksize;
+        < chkfs::blocksize;
 }
 
 inline void bcentry::clear() {

@@ -23,7 +23,7 @@ struct elf_program;
 
 extern int canary;
 
-#define NFILES 256
+#define NFILES 128
 
 // Process descriptor type
 struct __attribute__((aligned(4096))) proc {
@@ -78,13 +78,12 @@ struct __attribute__((aligned(4096))) proc {
     [[noreturn]] void resume();
     [[noreturn]] void panic_nonrunnable();
     void wake();
-    pid_t waitpid(pid_t pid, int* status = nullptr, int options = 0);
 
     bool check(uintptr_t addr, size_t sz, int perm);
     inline bool resumable() const;
 
     int syscall_fork(regstate* regs);
-
+    pid_t syscall_waitpid(pid_t pid, int* status = nullptr, int options = 0);
     uintptr_t syscall_read(regstate* reg);
     uintptr_t syscall_write(regstate* reg);
     uintptr_t syscall_readdiskfile(regstate* reg);
@@ -93,6 +92,7 @@ struct __attribute__((aligned(4096))) proc {
     int syscall_close(int fd);
     long syscall_pipe();
     int syscall_execv(const char* pathname, const char* const* argv, int argc);
+    int syscall_lseek(int fd, off_t off, int flag);
 
     inline irqstate lock_pagetable_read();
     inline void unlock_pagetable_read(irqstate& irqs);

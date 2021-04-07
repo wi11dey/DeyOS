@@ -7,7 +7,7 @@
 class keyboardnode : public vnode {
 public:
     size_t read(char* addr, size_t sz);
-    size_t write(char const* addr, size_t sz);
+    size_t write(const char* addr, size_t sz);
 };
 
 
@@ -23,21 +23,38 @@ public:
     int writers_ = 0;
 
     size_t read(char* addr, size_t sz);
-    size_t write(char const* addr, size_t sz);
+    size_t write(const char* addr, size_t sz);
 
     pipenode() = default;
 };
 
 
-class memnode : public vnode {
-    memfile& memfile_;
-    size_t offset_ = 0;
-
+class seekable : public vnode {
 public:
-    size_t read(char* addr, size_t sz);
-    size_t write(char const* addr, size_t sz);
+    off_t offset_ = 0;
+};
 
-    memnode(memfile& memfile, size_t offset): memfile_(memfile), offset_(offset) {
+
+class memnode : public seekable {
+public:
+    memfile& memfile_;
+
+    size_t read(char* addr, size_t sz);
+    size_t write(const char* addr, size_t sz);
+
+    memnode(memfile& memfile): memfile_(memfile) {
+    }
+};
+
+
+class disknode : public seekable {
+public:
+    chkfs::inode* inode_;
+
+    size_t read(char* addr, size_t sz);
+    size_t write(const char* addr, size_t sz);
+
+    disknode(chkfs::inode* inode): inode_(inode) {
     }
 };
 

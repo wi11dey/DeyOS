@@ -1,6 +1,8 @@
 #ifndef CHICKADEE_K_DEVICES_HH
 #define CHICKADEE_K_DEVICES_HH
 #include "kernel.hh"
+#include "chickadeefs.hh"
+#include "k-chkfs.hh"
 
 // keyboardstate: keyboard buffer and keyboard interrupts
 
@@ -139,6 +141,17 @@ struct memfile_loader : public proc_loader {
         : proc_loader(pt) {
         assert(mf_index >= 0 && unsigned(mf_index) < memfile::initfs_size);
         memfile_ = &memfile::initfs[mf_index];
+    }
+    ssize_t get_page(uint8_t** pg, size_t off) override;
+    void put_page() override;
+};
+
+struct diskfile_loader: public proc_loader {
+    chkfs::inode* inode_;
+    bcentry* e_;
+    inline diskfile_loader(const char* name, x86_64_pagetable* pt)
+        : proc_loader(pt) {
+        inode_ = chkfsstate::get().lookup_inode(name);
     }
     ssize_t get_page(uint8_t** pg, size_t off) override;
     void put_page() override;

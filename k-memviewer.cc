@@ -1,6 +1,7 @@
 #include "kernel.hh"
 #include "k-vmiter.hh"
 #include "k-ahci.hh"
+#include "k-chkfs.hh"
 
 // k-memviewer.cc
 //
@@ -86,8 +87,15 @@ void memusage::refresh() {
     }
 
     // mark AHCI state struct of SATA disk
+    bufcache& bc = bufcache::get();
     for (uintptr_t addr = ka2pa(sata_disk); addr < ka2pa(sata_disk + 1); addr += PAGESIZE) {
         mark(addr, f_kernel);
+    }
+    // bufcache also takes up memory
+    for (size_t i = 0; i < bufcache::ne; i++) {
+        if (bc.e_[i].buf_) {
+            mark(ka2pa(bc.e_[i].buf_), f_kernel);
+        }
     }
 
     // mark kernel ranges of physical memory
