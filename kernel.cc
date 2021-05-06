@@ -21,7 +21,7 @@ std::atomic<int> kdisplay;
 // keep it safe
 int canary = rand();
 
-static wait_queue waitpidq;
+wait_queue waitpidq;
 
 #define TIMERQS 5
 wait_queue timing_wheel[TIMERQS];
@@ -59,7 +59,7 @@ void kernel_start(const char* command) {
     initproc->init_kernel(1, init);
     {
         spinlock_guard guard(ptable_lock);
-        ptable[1] = initproc;
+        ptable[1] = pidtable[1] = initproc;
     }
 
     // start first process
@@ -110,9 +110,10 @@ void boot_process_start(pid_t pid, const char* name) {
     {
         spinlock_guard guard(ptable_lock);
         assert(!ptable[pid]);
-        ptable[pid] = p;
+        assert(!pidtable[pid]);
+        ptable[pid] = pidtable[pid] = p;
         p->ppid_ = 1;
-        ptable[1]->children_.push_back(p);
+        pidtable[1]->children_.push_back(p);
     }
 
     // add to run queue
@@ -211,27 +212,63 @@ int stackoverflow() {
 }
 
 
+unsigned int threads(proc* p, bool broken=false) {
+    unsigned int total = 0;
+    for (pid_t i = 0; i < NPROC; i++) {
+        if (ptable[i]
+            && ptable[i]->pid_ == p->pid_
+            && (ptable[i]->pstate_ == proc::ps_runnable
+                || ptable[i]->pstate_ == proc::ps_blocked
+                || (broken && ptable[i]->pstate_ == proc::ps_broken))) {
+            total++;
+        }
+    }
+    return total;
+}
+
+
 // process_reap(p)
 //    Clean up a zombie.
 
 int process_reap(proc* p) {
-    spinlock_guard guard(ptable_lock);
+    int status;
+    {
+        spinlock_guard guard(ptable_lock);
 
-    // remove from parent
-    if (p->child_links_.is_linked()) {
-        ptable[p->ppid_]->children_.erase(p);
+        // remove from parent
+        if (p->child_links_.is_linked()) {
+            pidtable[p->ppid_]->children_.erase(p);
+        }
+
+        // reparent children
+        while (proc* child = p->children_.pop_front()) {
+            child->ppid_ = 1;
+            ptable[1]->children_.push_back(child);
+        }
+
+        if (threads(p, true) == 1) {
+            // this is the last thread in this process, so all the memory should now be freed
+
+            // free virtual memory
+            for (vmiter it(p); it.va() < MEMSIZE_VIRTUAL; it.next()) {
+                if (it.perm(PTE_PWU) && it.pa() != ktext2pa(console)) {
+                    it.kfree_page();
+                }
+            }
+
+            // free pagetable
+            for (ptiter it(p); it.low(); it.next()) {
+                it.kfree_ptp();
+            }
+            kfree(p->pagetable_);
+        }
+
+        status = p->exit_status_;
+        ptable[p->id_] = pidtable[p->id_] = nullptr;
+        kfree(p->ftable_);
+        kfree(p);
     }
-
-    // reparent children
-    while (proc* child = p->children_.pop_front()) {
-        child->ppid_ = 1;
-        ptable[1]->children_.push_back(child);
-    }
-
-    int status = p->exit_status_;
-    ptable[p->id_] = nullptr;
-    kfree(p->pagetable_);
-    kfree(p);
+    waitpidq.wake_all();
     return status;
 }
 
@@ -247,17 +284,39 @@ int process_exit(proc* p, int status) {
     {
         spinlock_guard guard(ptable_lock);
 
-        // free virtual memory
-        for (vmiter it(p); it.va() < MEMSIZE_VIRTUAL; it.next()) {
-            if (it.perm(PTE_PWU) && it.pa() != ktext2pa(console)) {
-                it.kfree_page();
+        // take care of threads
+        if (threads(p) > 1) {
+            // start killing
+            for (pid_t i = 0; i < NPROC; i++) {
+                if (ptable[i]
+                    && ptable[i]->pid_ == p->pid_
+                    && ptable[i]->pstate_ != proc::ps_broken
+                    && ptable[i]->pid_ != p->id_){
+                    ptable[i]->exiting_ = true;
+                }
             }
+
+            // wait until every thread is dead
+            waiter().block_until(waitpidq, [&] () {
+                for (pid_t i = 0; i < NPROC; i++) {
+                    if (ptable[i]
+                        && ptable[i]->pid_ == p->pid_
+                        && ptable[i]->id_ != p->id_
+                        && ptable[i]->pstate_ != proc::ps_broken){
+                        if (!ptable[i]->exiting_) {
+                            ptable[i]->exiting_ = true;
+                        }
+                        if (ptable[i]->pstate_ == proc::ps_blocked) {
+                            ptable[i]->wake();
+                            waitpidq.wake_all();
+                        }
+                        return false;
+                    }
+                }
+                return true;
+            }, guard);
         }
 
-        // free pagetable
-        for (ptiter it(p); it.low(); it.next()) {
-            it.kfree_ptp();
-        }
         // switch CPU to safe pagetable before making the current one invalid
         // set_pagetable(early_pagetable);
         // root `pagetable_` pointer cleaned up at a safe time by reaper
@@ -280,6 +339,20 @@ int process_exit(proc* p, int status) {
 }
 
 
+int process_texit(proc* p, int status) {
+    if (threads(p) == 1) {
+        process_exit(p, status);
+    } else {
+        // just mark this thread for reaping
+        p->exit_status_ = status;
+        p->pstate_ = proc::ps_broken;
+    }
+
+    waitpidq.wake_all();
+    return status;
+}
+
+
 // proc::syscall(regs)
 //    System call handler.
 //
@@ -288,7 +361,7 @@ int process_exit(proc* p, int status) {
 //    process in `%rax`.
 
 uintptr_t proc::syscall(regstate* regs) {
-    //log_printf("proc %d: syscall %ld @%p\n", id_, regs->reg_rax, regs->reg_rip);
+    // log_printf("proc %d: syscall %ld @%p", id_, regs->reg_rax, regs->reg_rip);
 
     // Record most recent user-mode %rip.
     recent_user_rip_ = regs->reg_rip;
@@ -308,6 +381,10 @@ uintptr_t proc::syscall(regstate* regs) {
         break;                  // will not be reached
 
     case SYSCALL_GETPID:
+        result = pid_;
+        break;
+
+    case SYSCALL_GETTID:
         result = id_;
         break;
 
@@ -323,7 +400,7 @@ uintptr_t proc::syscall(regstate* regs) {
         int status;
         pid_t pid = syscall_waitpid(regs->reg_rdi, &status, regs->reg_rsi);
         result = pid | (((unsigned long) status) << 32);
-        break;        
+        break;
     }
 
     case SYSCALL_PAGE_ALLOC: {
@@ -365,13 +442,22 @@ uintptr_t proc::syscall(regstate* regs) {
         yield_noreturn();
         break;
 
+    case SYSCALL_TEXIT:
+        process_texit(this, regs->reg_rdi);
+        yield_noreturn();
+        break;
+
     case SYSCALL_FORK:
         result = syscall_fork(regs);
         break;
 
+    case SYSCALL_CLONE:
+        result = syscall_clone(regs);
+        break;
+
     case SYSCALL_EXECV:
         result = syscall_execv(reinterpret_cast<const char*>(regs->reg_rdi), reinterpret_cast<const char* const*>(regs->reg_rsi), regs->reg_rdx);
-        if (!result){
+        if (!result) {
             yield_noreturn();
         }
         break;
@@ -1060,43 +1146,65 @@ pid_t proc::syscall_waitpid(pid_t pid, int* status, int options) {
         return E_CHILD;
     }
 
-    proc* zombie = nullptr;
+    int exit_status = 0;
+    pid_t reaped = 0;
     {
         waiter w;
         w.p_ = this;
         spinlock_guard guard(ptable_lock);
         proc* child = nullptr;
+        // pid_t i = 0;
         w.block_until(waitpidq, [&, pid, options, child]() mutable -> bool {
             if (pid) {
-                if (ptable[pid]->pstate_ == ps_broken) {
-                    zombie = ptable[pid];
-                }
-            } else {
-                // wait for any child
-                for (child = children_.front(); child; child = children_.next(child)) {
-                    if (child->pstate_ == ps_broken) {
-                        zombie = child;
-                        break;
+                for (pid_t i = 0; i < NPROC; i++) {
+                    if (ptable[i]
+                        && ptable[i]->pid_ == pid
+                        && ptable[i]->pstate_ == ps_broken) {
+                        reaped = ptable[i]->pid_;
+                        guard.lock_.unlock(guard.irqs_);
+                        exit_status = process_reap(ptable[pid]);
+                        guard.irqs_ = guard.lock_.lock();
                     }
-                }
+                        }
+                    } else {
+                        // wait for any child
+                        for (child = children_.front(); child; child = children_.next(child)) {
+                            if (child->pstate_ == ps_broken) {
+                                reaped = child->pid_;
+                                guard.lock_.unlock(guard.irqs_);
+                                exit_status = process_reap(ptable[child->id_]);
+                                guard.irqs_ = guard.lock_.lock();
+                                break;
+                            }
+                        }
+                    }
+
+                    if (options & W_NOHANG) {
+                        return true;
+                    }
+
+                    if (!reaped) {
+                        return false;
+                    }
+
+                    for (pid_t i = 0; i < NPROC; i++) {
+                        if (ptable[i] && ptable[i]->pid_ == pid) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }, guard);
             }
 
-            return zombie || (options & W_NOHANG);
-        }, guard);
-    }
-    assert(options & W_NOHANG || zombie->pstate_ == ps_broken);
+            if (!reaped && options & W_NOHANG) {
+                return E_AGAIN;
+            }
 
-    if (!zombie && options & W_NOHANG) {
-        return E_AGAIN;
-    }
+            if (status) {
+                *status = exit_status;
+            }
 
-    pid_t zid = zombie->id_;
-    int exit_status = process_reap(zombie);
-    if (status) {
-        *status = exit_status;
-    }
-
-    return zid;
+            return reaped;
 }
 
 
@@ -1124,7 +1232,7 @@ int proc::syscall_fork(regstate* regs) {
         }
 
         // allocate blank process descriptor and store in table
-        newproc = ptable[newpid] = knew<proc>();
+        newproc = ptable[newpid] = pidtable[newpid] = knew<proc>();
         if (!newproc) {
             return E_NOMEM;
         }
@@ -1132,7 +1240,7 @@ int proc::syscall_fork(regstate* regs) {
         // allocate pagetable
         newpagetable = newproc->pagetable_ = kalloc_pagetable();
         if (!newpagetable) {
-            ptable[newpid] = nullptr;
+            ptable[newpid] = pidtable[newpid] = nullptr;
             kfree(newproc);
             return E_NOMEM;
         }
@@ -1200,6 +1308,49 @@ int proc::syscall_fork(regstate* regs) {
 
     // parent process gets new process' PID as return value
     return newpid;
+}
+
+
+int proc::syscall_clone(regstate* regs) {
+    proc* newproc = knew<proc>();
+
+    {
+        spinlock_guard guard(ptable_lock);
+
+        newproc->ppid_ = ppid_;
+        newproc->yields_ = nullptr;
+        newproc->pid_ = pid_;
+        newproc->ftable_ = ftable_;
+        newproc->pstate_ = proc::ps_runnable;
+        newproc->pagetable_ = pagetable_;
+        newproc->canary_ = canary;
+
+        // find thread id
+        pid_t newid = -1;
+        for (pid_t i = 1; i < NPROC; i++) {
+            if (!ptable[i] || ptable[i]->pstate_ == proc::ps_blank) {
+                newid = i;
+                break;
+            }
+        }
+        if (newid < 0) {
+            kfree(newproc);
+            return E_MFILE;
+        }
+        newproc->id_ = newid;
+        ptable[newproc->id_] = newproc;
+
+        pidtable[newproc->ppid_]->children_.push_back(newproc);
+
+        newproc->regs_ = reinterpret_cast<regstate*>(reinterpret_cast<uintptr_t>(newproc) + PROCSTACK_SIZE) - 1;
+        *newproc->regs_ = *regs;
+        newproc->regs_->reg_rax = 0;
+    }
+
+    int cpu = newproc->home_cpu_ = newproc->id_%ncpu;
+    cpus[cpu].enqueue(newproc);
+
+    return newproc->id_;
 }
 
 

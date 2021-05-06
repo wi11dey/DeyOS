@@ -70,6 +70,14 @@ void assert_fail(const char* file, int line, const char* msg,
 //    Create a new thread.
 
 pid_t sys_clone(int (*function)(void*), void* arg, char* stack_top) {
-    // Your code here
-    return E_NOSYS;
+    pid_t status = make_syscall(SYSCALL_CLONE);
+    if (!status) {
+        register uintptr_t rax asm("rax") = reinterpret_cast<uintptr_t>(function);
+        asm volatile ("call *%%rax"
+                      : "+a" (rax), "+D" (arg)
+                      :
+                      : "cc", "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11");
+        sys_texit(rax);
+    }
+    return status;
 }

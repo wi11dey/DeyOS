@@ -3,8 +3,9 @@
 #include "k-vmiter.hh"
 #include "k-devices.hh"
 
-proc* ptable[NPROC];            // array of process descriptor pointers
-spinlock ptable_lock;           // protects `ptable`
+proc* ptable[NPROC];            // array of process descriptor pointers per thread
+proc* pidtable[NPROC];          // array of process descriptor pointers per process
+spinlock ptable_lock;           // protects `ptable` and 'pidtable'
 
 // proc::proc()
 //    The constructor initializes the `proc` to empty.
@@ -31,6 +32,7 @@ void proc::init_user(pid_t pid, x86_64_pagetable* pt, bool keep_ftable) {
     assert(pt->entry[511] == early_pagetable->entry[511]);
 
     id_ = pid;
+    pid_ = pid;
     pagetable_ = pt;
     pstate_ = proc::ps_runnable;
 
@@ -44,6 +46,11 @@ void proc::init_user(pid_t pid, x86_64_pagetable* pt, bool keep_ftable) {
     regs_->reg_swapgs = 1;
 
     if (!keep_ftable) {
+        if (ftable_) {
+            kfree(ftable_);
+            ftable_ = nullptr;
+        }
+        ftable_ = (file**) kalloc(sizeof(file*)*NFILES);
         memset(ftable_, 0, sizeof(file*)*NFILES);
     }
 }
@@ -58,6 +65,7 @@ void proc::init_kernel(pid_t pid, void (*f)()) {
     assert(!(addr & PAGEOFFMASK));
 
     id_ = pid;
+    pid_ = pid;
     pagetable_ = early_pagetable;
     pstate_ = proc::ps_runnable;
 

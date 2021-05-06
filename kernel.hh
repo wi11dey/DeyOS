@@ -32,7 +32,8 @@ struct __attribute__((aligned(4096))) proc {
     };
 
     // These four members must come first:
-    pid_t id_ = 0;                             // Process ID
+    pid_t id_ = 0;                             // Thread ID
+    pid_t pid_ = 0;                            // Process ID
     regstate* regs_ = nullptr;                 // Process's current registers
     yieldstate* yields_ = nullptr;             // Process's current yield state
     std::atomic<int> pstate_ = ps_blank;       // Process state
@@ -51,12 +52,13 @@ struct __attribute__((aligned(4096))) proc {
 
     int home_cpu_;
     std::atomic<bool> interrupted_ = false;
+    std::atomic<bool> exiting_ = false;
     int exit_status_;
 
     int canary_;
 
     spinlock ftable_lock_;
-    file* ftable_[NFILES];
+    file** ftable_ = nullptr;
 
 
     proc();
@@ -83,6 +85,7 @@ struct __attribute__((aligned(4096))) proc {
     inline bool resumable() const;
 
     int syscall_fork(regstate* regs);
+    int syscall_clone(regstate* regs);
     pid_t syscall_waitpid(pid_t pid, int* status = nullptr, int options = 0);
     uintptr_t syscall_read(regstate* reg);
     uintptr_t syscall_write(regstate* reg);
@@ -103,8 +106,11 @@ struct __attribute__((aligned(4096))) proc {
     static int load_segment(const elf_program& ph, proc_loader& ld);
 };
 
+extern wait_queue waitpidq;
+
 #define NPROC 16
 extern proc* ptable[NPROC];
+extern proc* pidtable[NPROC];
 extern spinlock ptable_lock;
 #define PROCSTACK_SIZE 4096UL
 
