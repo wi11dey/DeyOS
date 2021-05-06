@@ -261,14 +261,17 @@ int process_reap(proc* p) {
                 it.kfree_ptp();
             }
             kfree(p->pagetable_);
+
+            // free file table
+            kfree(p->ftable_);
         }
 
         status = p->exit_status_;
         ptable[p->id_] = pidtable[p->id_] = nullptr;
-        kfree(p->ftable_);
         kfree(p);
     }
     waitpidq.wake_all();
+    log_printf("process_reap returning %d\n", status);
     return status;
 }
 
@@ -277,6 +280,7 @@ int process_reap(proc* p) {
 //    Exit the given process with status code `status`.
 
 int process_exit(proc* p, int status) {
+    p->exit_status_ = status;
     for (int i = 0; i < NFILES; i++) {
         p->syscall_close(i);
     }
@@ -291,13 +295,14 @@ int process_exit(proc* p, int status) {
                 if (ptable[i]
                     && ptable[i]->pid_ == p->pid_
                     && ptable[i]->pstate_ != proc::ps_broken
-                    && ptable[i]->pid_ != p->id_){
+                    && ptable[i]->id_ != p->id_){
                     ptable[i]->exiting_ = true;
                 }
             }
 
             // wait until every thread is dead
-            waiter().block_until(waitpidq, [&] () {
+            waiter w;
+            w.block_until(waitpidq, [&] () -> bool {
                 for (pid_t i = 0; i < NPROC; i++) {
                     if (ptable[i]
                         && ptable[i]->pid_ == p->pid_
@@ -316,10 +321,6 @@ int process_exit(proc* p, int status) {
                 return true;
             }, guard);
         }
-
-        // switch CPU to safe pagetable before making the current one invalid
-        // set_pagetable(early_pagetable);
-        // root `pagetable_` pointer cleaned up at a safe time by reaper
 
         // schedule to be cleaned up at the right time by reaper
         p->pstate_ = proc::ps_broken;
@@ -393,6 +394,10 @@ uintptr_t proc::syscall(regstate* regs) {
         break;
 
     case SYSCALL_YIELD:
+        if (exiting_) {
+            pstate_ = ps_broken;
+        }
+        waitpidq.wake_all();
         yield();
         break;
 
@@ -1152,9 +1157,7 @@ pid_t proc::syscall_waitpid(pid_t pid, int* status, int options) {
         waiter w;
         w.p_ = this;
         spinlock_guard guard(ptable_lock);
-        proc* child = nullptr;
-        // pid_t i = 0;
-        w.block_until(waitpidq, [&, pid, options, child]() mutable -> bool {
+        w.block_until(waitpidq, [&, pid, options]() -> bool {
             if (pid) {
                 for (pid_t i = 0; i < NPROC; i++) {
                     if (ptable[i]
@@ -1162,49 +1165,57 @@ pid_t proc::syscall_waitpid(pid_t pid, int* status, int options) {
                         && ptable[i]->pstate_ == ps_broken) {
                         reaped = ptable[i]->pid_;
                         guard.lock_.unlock(guard.irqs_);
-                        exit_status = process_reap(ptable[pid]);
+                        log_printf("exit_status was %d\n", exit_status);
+                        if (int process_status = process_reap(ptable[i])) {
+                            exit_status = process_status;
+                        }
+                        log_printf("exit_status is %d\n", exit_status);
                         guard.irqs_ = guard.lock_.lock();
                     }
+                }
+            } else {
+                // wait for any child
+                for (proc* child = children_.front(); child; child = children_.next(child)) {
+                    if (child->pstate_ == ps_broken) {
+                        reaped = child->pid_;
+                        guard.lock_.unlock(guard.irqs_);
+                        log_printf("exit_status was %d\n", exit_status);
+                        if (int process_status = process_reap(ptable[child->id_])) {
+                            exit_status = process_status;
                         }
-                    } else {
-                        // wait for any child
-                        for (child = children_.front(); child; child = children_.next(child)) {
-                            if (child->pstate_ == ps_broken) {
-                                reaped = child->pid_;
-                                guard.lock_.unlock(guard.irqs_);
-                                exit_status = process_reap(ptable[child->id_]);
-                                guard.irqs_ = guard.lock_.lock();
-                                break;
-                            }
-                        }
+                        log_printf("exit_status is %d\n", exit_status);
+                        guard.irqs_ = guard.lock_.lock();
+                        break;
                     }
-
-                    if (options & W_NOHANG) {
-                        return true;
-                    }
-
-                    if (!reaped) {
-                        return false;
-                    }
-
-                    for (pid_t i = 0; i < NPROC; i++) {
-                        if (ptable[i] && ptable[i]->pid_ == pid) {
-                            return false;
-                        }
-                    }
-                    return true;
-                }, guard);
+                }
             }
 
-            if (!reaped && options & W_NOHANG) {
-                return E_AGAIN;
+            if (options & W_NOHANG) {
+                return true;
             }
 
-            if (status) {
-                *status = exit_status;
+            if (!reaped) {
+                return false;
             }
 
-            return reaped;
+            for (pid_t i = 0; i < NPROC; i++) {
+                if (ptable[i] && ptable[i]->pid_ == pid) {
+                    return false;
+                }
+            }
+            return true;
+        }, guard);
+    }
+
+    if (!reaped && options & W_NOHANG) {
+        return E_AGAIN;
+    }
+
+    if (status) {
+        *status = exit_status;
+    }
+
+    return reaped;
 }
 
 
