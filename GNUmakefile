@@ -17,10 +17,10 @@ assemble = $(CXX) $(CPPFLAGS) $(DEPCFLAGS) $(ASFLAGS) $(1)
 link = $(LD) $(LDFLAGS) $(1)
 run = $(1) $(3)
 else
-cxxcompile = @/bin/echo " " $(2) && $(CXX) $(CPPFLAGS) $(DEPCFLAGS) $(1)
-assemble = @/bin/echo " " $(2) && $(CXX) $(CPPFLAGS) $(DEPCFLAGS) $(ASFLAGS) $(1)
-link = @/bin/echo " " $(2) $(patsubst %.full,%,$@) && $(LD) $(LDFLAGS) $(1)
-run = @$(if $(2),/bin/echo " " $(2) $(3) &&,) $(1) $(3)
+cxxcompile = @echo " " $(2) && $(CXX) $(CPPFLAGS) $(DEPCFLAGS) $(1)
+assemble = @echo " " $(2) && $(CXX) $(CPPFLAGS) $(DEPCFLAGS) $(ASFLAGS) $(1)
+link = @echo " " $(2) $(patsubst %.full,%,$@) && $(LD) $(LDFLAGS) $(1)
+run = @$(if $(2),echo " " $(2) $(3) &&,) $(1) $(3)
 endif
 
 # `$(D)` controls how QEMU responds to faults. Run `make D=1 run` to
@@ -53,7 +53,9 @@ KERNEL_OBJS = $(OBJDIR)/k-exception.ko \
 
 PROCESSES ?= $(patsubst %.cc,%,$(wildcard p-*.cc))
 
-PROCESS_LIB_OBJS = $(OBJDIR)/lib.uo $(OBJDIR)/u-lib.uo $(OBJDIR)/crc32c.uo
+EMACS_OBJS = $(wildcard emacs/src/*.o)
+
+PROCESS_LIB_OBJS = $(OBJDIR)/lib.uo $(OBJDIR)/u-lib.uo $(OBJDIR)/crc32c.uo $(EMACS_OBJS)
 
 INITFS_CONTENTS = \
 	$(shell find initfs -type f -not -name '\#*\#' -not -name '*~' 2>/dev/null) \
@@ -114,6 +116,9 @@ $(OBJDIR)/%.uo: %.cc $(BUILDSTAMPS)
 $(OBJDIR)/%.uo: %.S $(OBJDIR)/u-asm.h $(BUILDSTAMPS)
 	$(call assemble,-O2 -c $< -o $@,ASSEMBLE $<)
 
+# Emacs
+emacs:
+	$(MAKE) -C emacs/src
 
 # How to make supporting source files
 
@@ -125,7 +130,7 @@ $(OBJDIR)/u-asm.h: u-lib.hh lib.hh types.h x86-64.h build/mkkernelasm.awk $(BUIL
 	$(call cxxcompile,-dM -E u-lib.hh | awk -f build/mkkernelasm.awk | sort > $@,CREATE $@)
 	@if test ! -s $@; then echo '* Error creating $@!' 1>&2; exit 1; fi
 
-$(OBJDIR)/k-firstprocess.h:
+$(OBJDIR)/k-firstprocess.h: emacs
 	$(call run,echo '#ifndef CHICKADEE_FIRST_PROCESS' >$@; echo '#define CHICKADEE_FIRST_PROCESS "$(CHICKADEE_FIRST_PROCESS)"' >>$@; echo '#endif' >>$@,CREATE $@)
 
 $(OBJDIR)/k-initfs.cc: build/mkinitfs.awk \

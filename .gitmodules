@@ -1,3 +1,4 @@
 [submodule "emacs"]
 	path = emacs
 	url = https://github.com/wi11dey/emacs.git
+	branch = scratch/proj

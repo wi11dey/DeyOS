@@ -33,7 +33,7 @@ HOSTCXXFLAGS := $(CXXFLAGS) -std=gnu++1z -Wall -W
 # Compiler flags
 # -Os is required for the boot loader to fit within 512 bytes;
 # -ffreestanding means there is no standard library.
-CPPFLAGS := $(DEFS) -I.
+CPPFLAGS := $(DEFS) -I. -Iemacs/src
 
 CCOMMONFLAGS := -m64 -mno-mmx -mno-sse -mno-sse2 -mno-sse3 \
 	-mno-3dnow -ffreestanding -fno-omit-frame-pointer -fno-pic \
@@ -159,7 +159,8 @@ always:
 	run-gdb run-gdb-graphic run-gdb-console run-gdb-report \
 	check-qemu-console check-qemu kill \
 	run-% run-graphic-% run-console-% run-monitor-% \
-	run-gdb-% run-gdb-graphic-% run-gdb-console-%
+	run-gdb-% run-gdb-graphic-% run-gdb-console-% \
+	emacs
 
 # Eliminate default suffix rules
 .SUFFIXES:

@@ -1,5 +1,6 @@
 #include "u-lib.hh"
+#include "main.hh"
 
 void process_main(int argc, char** argv) {
-    sys_exit(0);
+    sys_exit(main(argc, argv));
 }
