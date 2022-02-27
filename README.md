@@ -1,8 +1,15 @@
-Chickadee OS
+DeyOS
 ============
 
-This is Chickadee, a teaching operating system built for Harvard’s
-[CS 161].
+This is DeyOS, built for Harvard’s [CS 161] based on Chickadee.
+
+Parts built by me include:
+
+- Memory management via buddy allocation
+- Multiprocessing and interruption
+- Filesystem and virtual filesystem API
+- Disk and buffer caching
+- Threading and GNU Emacs port
 
 Quickstart: `make run` or `make run-PROGRAM`
 
